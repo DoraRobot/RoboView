@@ -1,10 +1,12 @@
 # i18n-system-fonts — 方案
 
-状态：Draft（草案）
+状态：Approved（已批准）
 
 日期：2026-09-02
 
 相关：`spec.md`（Approved）；ADR 004、ADR 006；`docs/specs/display-types/`（texts.rs 现结构）
+
+修订记录：2026-09-02 起草；经负责人评审通过（In Review → Approved）。
 
 ## 1. 概述
 
