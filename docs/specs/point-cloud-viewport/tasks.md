@@ -1,10 +1,10 @@
 # point-cloud-viewport — 任务清单
 
-状态：In Review（评审中，跟随 plan.md）
+状态：Completed（已完成——T1–T14 全部执行完毕，负责人验收通过）
 
 日期：2026-09-02
 
-相关：`spec.md`（Approved）、`plan.md`（In Review）
+相关：`spec.md`（Approved）、`plan.md`（Approved）
 
 > 约定：任务原子、可独立验证（ADR 004 规则 3）；验证渠道 UT=core 单测（无 GUI/无 GPU）、
 > CI=门禁/脚本、MAN=手工验收。每条完成时在此勾选并附提交哈希（留痕，不写进代码）。
