@@ -2039,6 +2039,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui-wgpu",
+ "glam",
  "rfd",
  "roboview-core",
  "tracing",
