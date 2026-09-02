@@ -2,7 +2,7 @@
 //! scene viewport.
 //!
 //! Opening files appends to the scene (display-types spec §1 replaces the
-//! first feature's single-slot swap, `docs/specs/point-cloud-viewport/`):
+//! first feature's single-slot swap, `docs/specs/001-point-cloud-viewport/`):
 //! each successful load adds one object named by its file stem, the first
 //! object of an empty scene frames the scene bounds, later adds never move
 //! the camera (spec §6). Failure keeps every existing object and surfaces
@@ -58,11 +58,11 @@ enum OpenKind {
 
 impl OpenKind {
     /// The File menu label of this family.
-    fn menu_label(self) -> &'static str {
+    fn menu_label(self, locale: texts::Locale) -> &'static str {
         match self {
-            OpenKind::PointCloud => texts::MENU_OPEN_POINT_CLOUD,
-            OpenKind::Mesh => texts::MENU_OPEN_MESH,
-            OpenKind::Path => texts::MENU_OPEN_PATH,
+            OpenKind::PointCloud => texts::menu_open_point_cloud(locale),
+            OpenKind::Mesh => texts::menu_open_mesh(locale),
+            OpenKind::Path => texts::menu_open_path(locale),
         }
     }
 
@@ -70,21 +70,24 @@ impl OpenKind {
     /// extension list). The lists never carry a dot: the repository check
     /// script `scripts/check_data_paths.sh` (spec A12) treats a quoted
     /// `.<ext>` in production code as a hardcoded data path.
-    fn dialog_spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
+    fn dialog_spec(
+        self,
+        locale: texts::Locale,
+    ) -> (&'static str, &'static str, &'static [&'static str]) {
         match self {
             OpenKind::PointCloud => (
-                texts::FILE_DIALOG_TITLE_POINT_CLOUD,
-                texts::FILE_DIALOG_FILTER_POINT_CLOUD,
+                texts::file_dialog_title_point_cloud(locale),
+                texts::file_dialog_filter_point_cloud(locale),
                 &["ply", "pcd"],
             ),
             OpenKind::Mesh => (
-                texts::FILE_DIALOG_TITLE_MESH,
-                texts::FILE_DIALOG_FILTER_MESH,
+                texts::file_dialog_title_mesh(locale),
+                texts::file_dialog_filter_mesh(locale),
                 &["obj"],
             ),
             OpenKind::Path => (
-                texts::FILE_DIALOG_TITLE_PATH,
-                texts::FILE_DIALOG_FILTER_PATH,
+                texts::file_dialog_title_path(locale),
+                texts::file_dialog_filter_path(locale),
                 &["csv", "xyz"],
             ),
         }
@@ -117,6 +120,18 @@ struct PendingObject {
     object: LoadedObject,
 }
 
+/// Structured error state of the non-modal notification window (003 spec
+/// §6.4): the event is stored, the message is assembled per frame in the
+/// *current* locale — an open window follows a language switch.
+enum ErrorEvent {
+    /// A chosen file could not be loaded; the scene stays untouched (A10).
+    Failed { file: String, error: LoadError },
+    /// The background loader could not even be spawned.
+    StartFailed(std::io::Error),
+    /// The loader channel disconnected without an outcome.
+    Aborted,
+}
+
 /// The RoboView application: window shell + viewport state.
 struct RoboViewApp {
     /// Scene, renderer, and per-frame rect, shared with the wgpu paint
@@ -130,8 +145,11 @@ struct RoboViewApp {
     /// In-flight background load. `Some` also drives the single-flight
     /// guard that disables the Open menu items while a load runs.
     load: Option<Receiver<LoadOutcome>>,
-    /// Message of the non-modal error window; `None` hides the window.
-    error_message: Option<String>,
+    /// Active UI locale; flows down to every copy consumer (003 spec §6.2 —
+    /// explicit injection, no global mutable state).
+    locale: texts::Locale,
+    /// Structured error event of the non-modal error window; `None` hides it.
+    error: Option<ErrorEvent>,
     /// The Add frame dialog of the objects panel (spec §7 F3).
     add_frame_dialog: AddFrameDialog,
     /// The Add marker dialog of the objects panel (spec §7 F4).
@@ -143,11 +161,22 @@ impl RoboViewApp {
         // Dark theme by default: point colors read best on a dark canvas.
         // Theme switching is out of scope (spec §5 non-goals).
         cc.egui_ctx.set_theme(egui::Theme::Dark);
+        // System fonts chain (003 spec §6.1): install before the first
+        // frame so no frame renders with the bare default chain; timed for
+        // the M5/A7 acceptance record.
+        let t0 = std::time::Instant::now();
+        let defs = ui::fonts::load_system_fonts();
+        cc.egui_ctx.set_fonts(defs);
+        tracing::info!(
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "system fonts ready"
+        );
         Self {
             viewport: Arc::new(Mutex::new(ViewportState::new())),
             pending_object: None,
             load: None,
-            error_message: None,
+            locale: texts::Locale::from_tag(&sys_locale::get_locale().unwrap_or_default()),
+            error: None,
             add_frame_dialog: AddFrameDialog::new(),
             add_marker_dialog: AddMarkerDialog::new(),
         }
@@ -158,7 +187,7 @@ impl RoboViewApp {
     /// modal dialog); the menu disables itself while a load is in flight,
     /// so at most one worker exists at a time.
     fn open_file_dialog(&mut self, ctx: &egui::Context, kind: OpenKind) {
-        let (title, filter, extensions) = kind.dialog_spec();
+        let (title, filter, extensions) = kind.dialog_spec(self.locale);
         let Some(path) = rfd::FileDialog::new()
             .set_title(title)
             .add_filter(filter, extensions)
@@ -210,7 +239,7 @@ impl RoboViewApp {
             }
             Err(error) => {
                 tracing::warn!(%error, "could not start the background loader");
-                self.error_message = Some(texts::loader_start_failed(&error));
+                self.error = Some(ErrorEvent::StartFailed(error));
             }
         }
     }
@@ -230,12 +259,12 @@ impl RoboViewApp {
             }
             Ok(LoadOutcome::Failed { file, error }) => {
                 self.load = None;
-                self.error_message = Some(texts::load_failed(&file, &error));
+                self.error = Some(ErrorEvent::Failed { file, error });
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.load = None;
-                self.error_message = Some(texts::LOADER_ABORTED.to_owned());
+                self.error = Some(ErrorEvent::Aborted);
             }
         }
     }
@@ -257,13 +286,13 @@ impl RoboViewApp {
             viewport::lock_state(&self.viewport).install_object(pending.object, &pending.name);
         if installed {
             tracing::info!(name = %pending.name, "object added to the scene");
-            self.error_message = None;
+            self.error = None;
         } else {
             // Invariant violation (renderer_ready just said yes); the
             // loaded data is lost — log loudly rather than loop.
             tracing::error!(name = %pending.name, "pending object dropped: renderer vanished");
             self.pending_object = None;
-            self.error_message = None;
+            self.error = None;
         }
     }
 
@@ -271,14 +300,27 @@ impl RoboViewApp {
     /// load runs (single-flight loading).
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let loading = self.load.is_some();
-        ui.menu_button(texts::MENU_FILE, |ui| {
+        ui.menu_button(texts::menu_file(self.locale), |ui| {
             for kind in [OpenKind::PointCloud, OpenKind::Mesh, OpenKind::Path] {
-                let open = ui.add_enabled(!loading, egui::Button::new(kind.menu_label()));
+                let open =
+                    ui.add_enabled(!loading, egui::Button::new(kind.menu_label(self.locale)));
                 if open.clicked() {
                     ui.close();
                     self.open_file_dialog(ui.ctx(), kind);
                 }
             }
+            // Language switcher (003 spec §6.2): self-named entries are
+            // stable identifiers; the menu is drawn before the panels of
+            // the same frame, so a direct switch is frame-consistent.
+            ui.separator();
+            ui.menu_button(texts::language_menu(self.locale), |ui| {
+                for locale in [texts::Locale::En, texts::Locale::ZhCn] {
+                    if ui.button(locale.name()).clicked() {
+                        self.locale = locale;
+                        ui.close();
+                    }
+                }
+            });
         });
     }
 
@@ -290,7 +332,9 @@ impl RoboViewApp {
         let requests = egui::SidePanel::left(egui::Id::new("objects_panel"))
             .resizable(true)
             .default_width(230.0)
-            .show(ctx, |ui| objects_panel::show_objects_panel(ui, &state))
+            .show(ctx, |ui| {
+                objects_panel::show_objects_panel(ui, &state, self.locale)
+            })
             .inner;
         if requests.open_add_frame {
             let (center, scale) = viewport::lock_state(&self.viewport).ui_defaults();
@@ -307,9 +351,16 @@ impl RoboViewApp {
     /// (it only reappears for a *new* failure).
     fn error_window(&mut self, ctx: &egui::Context) {
         let mut dismissed = false;
-        if let Some(message) = &self.error_message {
+        if let Some(event) = &self.error {
+            // Assemble in the *current* locale every frame (003 spec §6.4):
+            // an already-open error window follows a language switch.
+            let message = match event {
+                ErrorEvent::Failed { file, error } => texts::load_failed(self.locale, file, error),
+                ErrorEvent::StartFailed(error) => texts::loader_start_failed(self.locale, error),
+                ErrorEvent::Aborted => texts::loader_aborted(self.locale).to_owned(),
+            };
             let mut open = true;
-            egui::Window::new(texts::ERROR_WINDOW_TITLE)
+            egui::Window::new(texts::error_window_title(self.locale))
                 .id(egui::Id::new("roboview_error"))
                 .collapsible(false)
                 .resizable(false)
@@ -321,7 +372,7 @@ impl RoboViewApp {
             dismissed = !open;
         }
         if dismissed {
-            self.error_message = None;
+            self.error = None;
         }
     }
 }
@@ -359,13 +410,14 @@ impl eframe::App for RoboViewApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(panel_fill))
             .show(ctx, |ui| {
-                viewport::show_viewport(ui, &viewport_state, loading);
+                viewport::show_viewport(ui, &viewport_state, loading, self.locale);
             });
 
         // 5. Floating windows on top of the panels.
         self.error_window(ctx);
-        self.add_frame_dialog.show(ctx, &self.viewport);
-        self.add_marker_dialog.show(ctx, &self.viewport);
+        self.add_frame_dialog.show(ctx, &self.viewport, self.locale);
+        self.add_marker_dialog
+            .show(ctx, &self.viewport, self.locale);
     }
 }
 
