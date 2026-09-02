@@ -45,8 +45,11 @@ directory mirroring the same structure ([ADR 001](decisions/001-doc-localization
 - Every document in `docs/` ships with its `zh-CN` translation at the same
   relative path (sparse trees are allowed, §1.7; this project keeps
   translations current). `docs/specs/` is exempt (ADR 004).
-- Cross-workspace references are fully qualified: `point-cloud-viewport
+- Cross-workspace references are fully qualified: `001-point-cloud-viewport
   spec.md A7`; a bare `A7` is local to the current workspace only.
+- SDD feature workspaces are named `NNN-<kebab-name>` with a zero-padded
+  3-digit sequence (`001-`, `002-`, …) in creation order; sequences stay
+  unique and incrementing, old workspaces keep their number.
 - SDD workspace headers (spec/plan/tasks) update their status together on
   every status transition.
 

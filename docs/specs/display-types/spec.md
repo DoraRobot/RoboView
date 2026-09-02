@@ -6,7 +6,7 @@
 
 修订：2026-09-02（四视角评审后全面修订：取代关系、遮挡协议、共享深度路线、复合场景 C、稳定 id、非目标补齐、跨 spec 引用全限定；2026-09-02 负责人无异议批准：In Review → Approved）
 
-相关：ADR 004（SDD 工作区）、ADR 006（技术栈）、首个功能 `docs/specs/point-cloud-viewport/`（已闭环）
+相关：ADR 004（SDD 工作区）、ADR 006（技术栈）、首个功能 `docs/specs/001-point-cloud-viewport/`（已闭环）
 
 > 跨 workspace 引用约定：本节中凡引用首功能条目均写全限定前缀
 > （如 `首功能 spec.md A7`、`首功能 plan.md §3.2`）；裸编号（A/M/US/F）仅在本 workspace 内有效。
