@@ -1,10 +1,10 @@
 # i18n-system-fonts — 规格
 
-状态：Draft（草案）
+状态：Approved（已批准）
 
 日期：2026-09-02
 
-修订：2026-09-02（四视角评审后全面修订；负责人裁定 4 项决策已落位正文：D1 自研 fontdb、locale 显式注入、CI 预装 CJK 字体、display-types 祖父例外不占 002 号）
+修订：2026-09-02（四视角评审后全面修订；负责人裁定 4 项决策已落位正文：D1 自研 fontdb、locale 显式注入、CI 预装 CJK 字体、display-types 祖父例外不占 002 号；2026-09-02 负责人定稿批准：In Review → Approved，§7 已裁定节删除并落位正文）
 
 相关：ADR 004（SDD 工作区）、ADR 006（技术栈）、`docs/specs/display-types/`（已实现：`texts.rs` 文案集中，§6.5）、`docs/specs/001-point-cloud-viewport/`（性能协议 A11 基线）
 
@@ -122,12 +122,3 @@
   键名与标识符不因本功能改变，仍为英文（§1.3）；UI 文案英文为先、zh 为译本（§6.5，缺失回退英文）。
 - 回归执行：display-types 各 MAN 验收以 **En locale** 执行（判据按行为、不按文案字面）。
 
-## 7. 决策点（已裁定：2026-09-02 负责人拍板；批准时删除本节并落位正文）
-
-- D1 字体加载：**自研 fontdb 胶水**（fontdb 0.23 + sys-locale 0.3）——crates.io 全量核验无配对
-  egui 0.32.3 的现成库（egui-system-fonts/egui_zhcn_fonts/egui-chinese-font/
-  egui-chinese-support/egui-cjk-font/egui_font_loader 均版本或许可声明不满足）；
-  升级 egui ≥0.34 作为独立范围变更排除。
-- D2 语言检测：`sys-locale`（MIT OR Apache-2.0、零依赖）。
-- D3 texts 改造：**key 表 + 显式注入 getter**（无全局可变；调用点机械改造）。
-- D4 翻译范围：见 §6.3 清单（~55-60 项）。
