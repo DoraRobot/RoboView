@@ -5,6 +5,8 @@ use std::sync::Arc;
 use crate::io;
 use crate::render;
 
+use super::DisplayKind;
+
 /// A point cloud display: the loaded CPU-side data together with the GPU
 /// mesh uploaded for it, if any.
 ///
@@ -28,5 +30,17 @@ impl PointCloud {
     /// in [`PointCloud::mesh`].
     pub fn from_data(data: io::PointCloudData) -> Self {
         PointCloud { data, mesh: None }
+    }
+}
+
+/// Report removals to the render handle ledger (spec A6): a point cloud
+/// display that held an uploaded handle counts one destroyed event for the
+/// point cloud kind when it leaves the scene; never-uploaded clouds leave
+/// the ledger untouched.
+impl Drop for PointCloud {
+    fn drop(&mut self) {
+        if self.mesh.is_some() {
+            render::counters::note_object_dropped(DisplayKind::PointCloud);
+        }
     }
 }

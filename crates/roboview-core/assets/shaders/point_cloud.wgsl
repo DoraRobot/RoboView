@@ -4,9 +4,12 @@
 //
 // Design notes:
 //
-// - One 1-pixel point per vertex, drawn as a `PointList` (no depth
-//   attachment; the egui pass has none, and the single-cloud view does not
-//   need ordering).
+// - One 1-pixel point per vertex, drawn as a `PointList`. The scene shares
+//   one depth attachment (display-types spec §6): the pipeline writes depth
+//   with a strict Less compare and zero bias, so point-vs-point and
+//   point-vs-geometry visibility follows the depth test instead of upload
+//   order. Points are the reference surface that later mesh pipelines are
+//   depth-biased against.
 //
 // - Colors are uploaded as packed sRGB bytes (Rgba8Unorm, one u32 per point).
 //   The hardware unorm-decodes the attribute into [0, 1] sRGB values in the

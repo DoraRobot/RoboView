@@ -14,6 +14,8 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use super::counters;
+use crate::displays::DisplayKind;
 use crate::io;
 
 /// Embedded WGSL source of the point cloud pipeline. Compiled headlessly
@@ -26,19 +28,22 @@ const POINT_CLOUD_SHADER_SOURCE: &str = include_str!("../../assets/shaders/point
 /// 0.8 * 255 = 204 and 0.9 * 255 = 229.5 rounds to 229.
 const DEFAULT_POINT_COLOR_SRGB: [u8; 4] = [204, 204, 229, 255];
 
-/// Byte stride of one position vertex: x, y, z as three `f32`.
-const POSITION_STRIDE_BYTES: u64 = 12;
+/// Byte stride of one position vertex: x, y, z as three `f32`. Shared with
+/// the mesh and line pipelines of the display-type family (crate-internal).
+pub(crate) const POSITION_STRIDE_BYTES: u64 = 12;
 
 /// Byte stride of one color vertex: a single packed Rgba8Unorm texel.
-const COLOR_STRIDE_BYTES: u64 = 4;
+/// Shared with the line pipeline (crate-internal).
+pub(crate) const COLOR_STRIDE_BYTES: u64 = 4;
 
 /// Byte size of the scene's single view-projection uniform buffer holding
 /// one `mat4x4<f32>`.
 const UNIFORM_SIZE_BYTES: u64 = 64;
 
 /// Vertex attribute of the position buffer (vertex slot 0): `x y z` at
-/// shader location 0.
-const POSITION_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
+/// shader location 0. Shared with the mesh and line pipelines
+/// (crate-internal).
+pub(crate) const POSITION_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
     format: wgpu::VertexFormat::Float32x3,
     offset: 0,
     shader_location: 0,
@@ -49,15 +54,17 @@ const POSITION_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
 /// four bytes into [0, 1] floats; the shader therefore declares the input
 /// as `vec4<f32>` and converts sRGB to linear itself (wgpu-core maps
 /// Unorm8x4 to a float vector: "the shader always sees data as float").
-const COLOR_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
+/// Shared with the line pipeline (crate-internal).
+pub(crate) const COLOR_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
     format: wgpu::VertexFormat::Unorm8x4,
     offset: 0,
     shader_location: 1,
 }];
 
 /// Serialize positions into tightly packed little-endian `f32` triples
-/// (GPU vertex data is little-endian on every supported backend).
-fn pack_positions(positions: &[glam::Vec3]) -> Vec<u8> {
+/// (GPU vertex data is little-endian on every supported backend). Shared
+/// with the scatter upload of the mesh pipeline (crate-internal).
+pub(crate) fn pack_positions(positions: &[glam::Vec3]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(positions.len() * POSITION_STRIDE_BYTES as usize);
     for point in positions {
         bytes.extend_from_slice(&point.x.to_le_bytes());
@@ -69,8 +76,9 @@ fn pack_positions(positions: &[glam::Vec3]) -> Vec<u8> {
 
 /// Serialize colors into one packed Rgba8Unorm (4 bytes) per point. File
 /// colors are 3 sRGB bytes, padded with an opaque alpha; when the data has
-/// no colors, every point gets [`DEFAULT_POINT_COLOR_SRGB`].
-fn pack_colors(count: usize, colors: Option<&[io::Color]>) -> Vec<u8> {
+/// no colors, every point gets [`DEFAULT_POINT_COLOR_SRGB`]. Shared with the
+/// scatter upload of the mesh pipeline (crate-internal).
+pub(crate) fn pack_colors(count: usize, colors: Option<&[io::Color]>) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(count * COLOR_STRIDE_BYTES as usize);
     match colors {
         Some(colors) => {
@@ -150,6 +158,28 @@ pub struct PointCloudMesh {
     colors: wgpu::Buffer,
     count: u32,
     bind_group: wgpu::BindGroup,
+}
+
+impl PointCloudMesh {
+    /// Assemble a point cloud mesh from already-created buffers (crate-
+    /// internal). The face-less scatter form of a mesh display (spec §7 F1)
+    /// is drawn through the point pipeline, so `render/mesh.rs` provisions
+    /// the same geometry shape and hands it to [`Renderer::paint`]; this
+    /// constructor is that path's only entry point, keeping the fields
+    /// private to the renderer module.
+    pub(crate) fn from_parts(
+        positions: wgpu::Buffer,
+        colors: wgpu::Buffer,
+        count: u32,
+        bind_group: wgpu::BindGroup,
+    ) -> Self {
+        Self {
+            positions,
+            colors,
+            count,
+            bind_group,
+        }
+    }
 }
 
 /// Owns the point cloud pipeline, the scene-wide view-projection uniform,
@@ -305,6 +335,39 @@ impl Renderer {
         self.sample_count
     }
 
+    /// The device every scene pipeline is built from — the injected host
+    /// device (see [`Renderer::new`]). The mesh and line pipelines of the
+    /// display-type family (`render/mesh.rs`, `render/line.rs`) are created
+    /// from this renderer and read the device, queue, formats, bind group
+    /// layout, and uniform buffer through these accessors, so the renderer
+    /// stays the single source of the shared-depth parameters for the whole
+    /// scene (plan §3.3): no family pipeline can be built with a depth
+    /// format or sample count that differs from the pass the host opens.
+    pub fn device(&self) -> &Arc<wgpu::Device> {
+        &self.device
+    }
+
+    /// The queue scene uploads write through; see [`Renderer::device`].
+    pub fn queue(&self) -> &Arc<wgpu::Queue> {
+        &self.queue
+    }
+
+    /// The scene-wide bind group layout (binding 0: the view-projection
+    /// uniform), shared verbatim by every family pipeline. Reusing this
+    /// exact layout object — rather than a structurally identical copy —
+    /// makes every mesh bind group layout-compatible with every pipeline.
+    pub fn scene_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.bind_group_layout
+    }
+
+    /// The scene's single view-projection uniform buffer (one 64-byte
+    /// `mat4x4<f32>`, rewritten once per frame by [`Renderer::update_uniform`]).
+    /// Family pipeline uploads bind their meshes against this same buffer,
+    /// so one queue write per frame reaches every pipeline of the scene.
+    pub fn uniform_buffer(&self) -> &wgpu::Buffer {
+        &self.uniform_buffer
+    }
+
     /// Write the view-projection matrix into the renderer's single uniform
     /// buffer, which every uploaded mesh's bind group references.
     ///
@@ -327,6 +390,10 @@ impl Renderer {
     /// view-projection buffer at binding 0; [`Renderer::update_uniform`]
     /// refreshes that buffer once per frame.
     pub fn upload(&mut self, data: &io::PointCloudData) -> Arc<PointCloudMesh> {
+        // A6 ledger (spec §4): provisioning a point cloud handle counts one
+        // created event; the display type's Drop counts the matching
+        // destroyed event when the object leaves the scene (counters.rs).
+        counters::note_uploaded(DisplayKind::PointCloud);
         let count = u32::try_from(data.positions.len()).expect(
             "more than u32::MAX points cannot be drawn in one call; holding that many \
              positions needs 51 GiB of RAM, far above what the io size guards admit",
