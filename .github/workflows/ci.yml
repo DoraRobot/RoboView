@@ -64,6 +64,13 @@ jobs:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  a9:
+    name: Spec A9 (no hardcoded data paths)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./scripts/check_data_paths.sh
+
   audit:
     name: Dependency audit (cargo audit)
     runs-on: ubuntu-latest
