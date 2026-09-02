@@ -26,6 +26,44 @@ pub struct Color {
     pub b: u8,
 }
 
+/// Axis-aligned bounding box on the CPU side. Custom (not taken from the
+/// math crate) so the spec G1 policy — non-finite coordinates are kept in
+/// the data but excluded from bounds — is exactly one implementation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Aabb {
+    pub min: glam::Vec3,
+    pub max: glam::Vec3,
+}
+
+impl Aabb {
+    /// Build the bounds of finite points only. Returns `None` when the
+    /// slice contains no finite point (spec G1: camera falls back to a
+    /// default framing).
+    pub fn from_points(points: &[glam::Vec3]) -> Option<Aabb> {
+        let mut min = glam::Vec3::splat(f32::INFINITY);
+        let mut max = glam::Vec3::splat(f32::NEG_INFINITY);
+        let mut finite = false;
+        for p in points {
+            if p.is_finite() {
+                finite = true;
+                min = min.min(*p);
+                max = max.max(*p);
+            }
+        }
+        finite.then_some(Aabb { min, max })
+    }
+
+    pub fn center(&self) -> glam::Vec3 {
+        (self.min + self.max) * 0.5
+    }
+
+    /// Largest dimension; 0 for degenerate boxes (single point / plane).
+    pub fn largest_dimension(&self) -> f32 {
+        let extent = self.max - self.min;
+        extent.x.max(extent.y).max(extent.z)
+    }
+}
+
 /// Loaded point cloud data: CPU side, renderer-independent.
 #[derive(Debug, Clone)]
 pub struct PointCloudData {
@@ -34,7 +72,7 @@ pub struct PointCloudData {
     pub colors: Option<Vec<Color>>,
     /// Bounding box of the valid (finite) points; `None` when no finite
     /// point exists (spec G1: non-finite points are kept, defended against).
-    pub bounds: Option<glam::Aabb3>,
+    pub bounds: Option<Aabb>,
     pub format: Format,
 }
 
