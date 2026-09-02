@@ -63,7 +63,7 @@ use roboview_core::scene::Scene;
 use roboview_core::scene::camera::OrbitCamera;
 
 use super::camera_input;
-use super::texts;
+use super::texts::{self, Locale};
 
 /// Scene-scale fallback of the UI-add dialogs when the scene has no
 /// measurable bounds (empty scene, or only frames/markers): mirrors the
@@ -434,10 +434,10 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         }
         // Pass 2 — triangle meshes, drawn by the mesh pipeline.
         for object in state.scene.iter_visible() {
-            if let DisplayObject::Mesh(mesh) = &object.object {
-                if let Some(render::MeshGpu::Faces(faces)) = mesh.gpu.as_ref() {
-                    mesh_pipeline.paint(render_pass, faces);
-                }
+            if let DisplayObject::Mesh(mesh) = &object.object
+                && let Some(render::MeshGpu::Faces(faces)) = mesh.gpu.as_ref()
+            {
+                mesh_pipeline.paint(render_pass, faces);
             }
         }
         for object in state.scene.iter_visible() {
@@ -469,7 +469,17 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
 /// Draw the central 3D viewport into `ui`: allocate the remaining space,
 /// feed pointer input to the camera, register this frame's paint callback,
 /// and paint the overlay labels — or the empty-state/loading placeholders.
-pub fn show_viewport(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>, loading: bool) {
+///
+/// `locale` resolves the in-viewport copy (loading label, empty hint) per
+/// frame; the state itself is locale-free (003 spec §6.3: `ViewportState`
+/// has zero locale dependency — generated names are data, axis letters are
+/// invariants).
+pub fn show_viewport(
+    ui: &mut egui::Ui,
+    state: &Arc<Mutex<ViewportState>>,
+    loading: bool,
+    locale: Locale,
+) {
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
 
     let has_content = {
@@ -515,7 +525,7 @@ pub fn show_viewport(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>, loadi
             painter.text(
                 corner,
                 egui::Align2::LEFT_BOTTOM,
-                texts::VIEWPORT_LOADING,
+                texts::viewport_loading(locale),
                 egui::FontId::proportional(13.0),
                 ui.visuals().weak_text_color(),
             );
@@ -529,7 +539,7 @@ pub fn show_viewport(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>, loadi
         painter.text(
             center + egui::vec2(0.0, 26.0),
             egui::Align2::CENTER_CENTER,
-            texts::VIEWPORT_LOADING,
+            texts::viewport_loading(locale),
             egui::FontId::proportional(16.0),
             ui.visuals().weak_text_color(),
         );
@@ -537,7 +547,7 @@ pub fn show_viewport(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>, loadi
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            texts::VIEWPORT_EMPTY_HINT,
+            texts::viewport_empty_hint(locale),
             egui::FontId::proportional(18.0),
             ui.visuals().weak_text_color(),
         );

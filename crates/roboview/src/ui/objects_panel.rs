@@ -5,9 +5,10 @@
 //! the File menu only opens files):
 //!
 //! - the heading;
-//! - the action row: the **Fit** control (spec §6: reframe the camera to
-//!   the union of the visible objects — disabled while nothing measurable
-//!   is visible) and the two **Add…** entries that open the dialogs below;
+//! - the action row: the **Fit** control (display-types spec §6: reframe
+//!   the camera to the union of the visible objects — disabled while nothing
+//!   measurable is visible) and the two **Add…** entries that open the
+//!   dialogs below;
 //! - the object list: one row per scene object in add order (spec §4). A
 //!   row shows the visibility checkbox, a kind label, the object's name
 //!   (truncated), and the remove button; every action is stable-id based
@@ -16,11 +17,14 @@
 //!   identity (`Id::new(object.id)`) so widget state never leaks between
 //!   rows as the list changes. The empty scene shows the hint copy instead.
 //!
-//! The add dialogs open non-modally next to the panel (spec §7 F3/F4):
-//! frame (origin + axis length) and marker (text label or arrow), with
-//! defaults derived from the visible scene bounds
+//! The add dialogs open non-modally next to the panel (display-types spec
+//! §7 F3/F4): frame (origin + axis length) and marker (text label or
+//! arrow), with defaults derived from the visible scene bounds
 //! ([`ViewportState::ui_defaults`]) so UI-placed geometry lands in view.
-//! All copy lives in `texts.rs`; the dialogs only read constants.
+//! All copy lives in `texts.rs`; every entry point takes the current
+//! [`Locale`] (003 spec §6.2: explicit injection) and reads its copy
+//! through `texts::…(locale)` — the dialogs store no locale of their own,
+//! so an open dialog re-renders in the switched language on the next frame.
 //!
 //! The scene lock is the same single uncontended lock the viewport panel
 //! uses ([`viewport::lock_state`]): the panel and dialogs run on the UI
@@ -34,7 +38,7 @@ use glam::Vec3;
 use roboview_core::displays::{DisplayKind, Marker};
 use roboview_core::scene::camera::OrbitCamera;
 
-use super::texts;
+use super::texts::{self, Locale};
 use super::viewport::{self, ViewportState};
 
 /// Panel requests to the caller (main.rs), consumed after the panel body
@@ -50,11 +54,15 @@ pub struct PanelRequests {
 
 /// Draw the objects sidebar into `ui` (used inside the left
 /// [`egui::SidePanel`]). Returns the requests the caller should act on.
-pub fn show_objects_panel(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>) -> PanelRequests {
+pub fn show_objects_panel(
+    ui: &mut egui::Ui,
+    state: &Arc<Mutex<ViewportState>>,
+    locale: Locale,
+) -> PanelRequests {
     let mut requests = PanelRequests::default();
 
     ui.add_space(4.0);
-    ui.heading(texts::OBJECTS_PANEL_TITLE);
+    ui.heading(texts::objects_panel_title(locale));
 
     // Action row: Fit + the two UI-add entries. Wrapped so a narrow panel
     // folds the buttons instead of clipping them.
@@ -62,11 +70,11 @@ pub fn show_objects_panel(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>) 
     ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
         if ui
-            .add_enabled(can_fit, egui::Button::new(texts::OBJECTS_FIT))
+            .add_enabled(can_fit, egui::Button::new(texts::objects_fit(locale)))
             .on_hover_text(if can_fit {
-                texts::OBJECTS_FIT_TOOLTIP
+                texts::objects_fit_tooltip(locale)
             } else {
-                texts::OBJECTS_FIT_TOOLTIP_DISABLED
+                texts::objects_fit_tooltip_disabled(locale)
             })
             .clicked()
         {
@@ -75,10 +83,10 @@ pub fn show_objects_panel(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>) 
             let mut viewport = viewport::lock_state(state);
             viewport.scene.camera = OrbitCamera::framing(viewport.scene.bounds_union().as_ref());
         }
-        if ui.button(texts::OBJECTS_ADD_FRAME).clicked() {
+        if ui.button(texts::objects_add_frame(locale)).clicked() {
             requests.open_add_frame = true;
         }
-        if ui.button(texts::OBJECTS_ADD_MARKER).clicked() {
+        if ui.button(texts::objects_add_marker(locale)).clicked() {
             requests.open_add_marker = true;
         }
     });
@@ -95,7 +103,8 @@ pub fn show_objects_panel(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>) 
     if ids.is_empty() {
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new(texts::OBJECTS_EMPTY_HINT).color(ui.visuals().weak_text_color()),
+            egui::RichText::new(texts::objects_empty_hint(locale))
+                .color(ui.visuals().weak_text_color()),
         );
         return requests;
     }
@@ -106,7 +115,7 @@ pub fn show_objects_panel(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>) 
         .max_height(ui.available_height())
         .show(ui, |ui| {
             for id in ids {
-                show_object_row(ui, state, id);
+                show_object_row(ui, state, locale, id);
             }
         });
 
@@ -117,7 +126,7 @@ pub fn show_objects_panel(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>) 
 /// snapshots the entry it shows, then acts by id — the scene is only
 /// locked for the snapshot and for the requested mutation, so rows never
 /// hold the lock while egui lays out widgets.
-fn show_object_row(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>, id: u64) {
+fn show_object_row(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>, locale: Locale, id: u64) {
     let Some((visible, kind, name)) = viewport::lock_state(state)
         .scene
         .get(id)
@@ -135,7 +144,7 @@ fn show_object_row(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>, id: u64
             if ui.checkbox(&mut visible, "").changed() {
                 viewport::lock_state(state).scene.toggle_visible(id);
             }
-            kind_pill(ui, kind);
+            kind_pill(ui, kind, locale);
             // The name takes the flexible middle slot, truncated; the
             // remove button is pinned to the row's right edge afterwards.
             let row_height = ui.spacing().interact_size.y.max(20.0);
@@ -152,7 +161,7 @@ fn show_object_row(ui: &mut egui::Ui, state: &Arc<Mutex<ViewportState>>, id: u64
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 remove = ui
                     .small_button(texts::OBJECTS_REMOVE)
-                    .on_hover_text(texts::OBJECTS_REMOVE_TOOLTIP)
+                    .on_hover_text(texts::objects_remove_tooltip(locale))
                     .clicked();
             });
         });
@@ -169,10 +178,10 @@ const REMOVE_SLOT: f32 = 26.0;
 /// The kind column: a small rounded label in the panel's code-tint color.
 /// The mapping from kind to copy is `texts::object_kind_label` — the core's
 /// `DisplayKind::as_str` is a ledger key, not UI text.
-fn kind_pill(ui: &mut egui::Ui, kind: DisplayKind) {
+fn kind_pill(ui: &mut egui::Ui, kind: DisplayKind, locale: Locale) {
     let color = ui.visuals().weak_text_color();
     let galley = ui.painter().layout_no_wrap(
-        texts::object_kind_label(kind).to_owned(),
+        texts::object_kind_label(locale, kind).to_owned(),
         egui::FontId::proportional(10.0),
         color,
     );
@@ -183,11 +192,11 @@ fn kind_pill(ui: &mut egui::Ui, kind: DisplayKind) {
     painter.galley(rect.min + pad, galley, color);
 }
 
-/// Non-modal Add frame dialog (spec §7 F3): origin + axis length, then
-/// "Add" uploads the frame through the line pipeline and appends it to the
-/// scene under a generated name. Adding closes the window — a frame is a
-/// one-shot placement, unlike the marker dialog which stays open for
-/// repeat adds.
+/// Non-modal Add frame dialog (display-types spec §7 F3): origin + axis
+/// length, then "Add" uploads the frame through the line pipeline and
+/// appends it to the scene under a generated name. Adding closes the window
+/// — a frame is a one-shot placement, unlike the marker dialog which stays
+/// open for repeat adds.
 pub struct AddFrameDialog {
     open: bool,
     origin: Vec3,
@@ -217,20 +226,25 @@ impl AddFrameDialog {
         self.speed = drag_speed(scale);
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, state: &Arc<Mutex<ViewportState>>) {
+    pub fn show(&mut self, ctx: &egui::Context, state: &Arc<Mutex<ViewportState>>, locale: Locale) {
         if !self.open {
             return;
         }
         let mut add = false;
-        egui::Window::new(texts::ADD_FRAME_WINDOW_TITLE)
+        egui::Window::new(texts::add_frame_window_title(locale))
             .id(egui::Id::new("add_frame_dialog"))
             .collapsible(false)
             .resizable(false)
             .open(&mut self.open)
             .show(ctx, |ui| {
-                xyz_row(ui, texts::ADD_FRAME_ORIGIN, &mut self.origin, self.speed);
+                xyz_row(
+                    ui,
+                    texts::add_frame_origin(locale),
+                    &mut self.origin,
+                    self.speed,
+                );
                 ui.horizontal(|ui| {
-                    ui.label(texts::ADD_FRAME_LENGTH);
+                    ui.label(texts::add_frame_length(locale));
                     // Negative or zero lengths draw no geometry in the line
                     // pipeline, so clamp the axis length to positive values.
                     ui.add(
@@ -241,7 +255,7 @@ impl AddFrameDialog {
                 });
                 // The confirm button, pinned right of the window.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(texts::ADD_OBJECT_BUTTON).clicked() {
+                    if ui.button(texts::add_object_button(locale)).clicked() {
                         add = true;
                     }
                 });
@@ -259,16 +273,16 @@ impl Default for AddFrameDialog {
     }
 }
 
-/// The chosen marker shape (spec §7 F4): a viewport overlay text label or
-/// a 3D arrow with a head.
+/// The chosen marker shape (display-types spec §7 F4): a viewport overlay
+/// text label or a 3D arrow with a head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MarkerShape {
     Text,
     Arrow,
 }
 
-/// Non-modal Add marker dialog (spec §7 F4): one shape radio (text
-/// label / arrow), shape-specific parameter rows, and "Add" — which
+/// Non-modal Add marker dialog (display-types spec §7 F4): one shape radio
+/// (text label / arrow), shape-specific parameter rows, and "Add" — which
 /// appends the marker under a generated name and stays open (closing via
 /// the window button), so several markers can be placed in one session.
 /// Adding a text label clears its text field for the next entry.
@@ -308,12 +322,12 @@ impl AddMarkerDialog {
         self.speed = drag_speed(scale);
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, state: &Arc<Mutex<ViewportState>>) {
+    pub fn show(&mut self, ctx: &egui::Context, state: &Arc<Mutex<ViewportState>>, locale: Locale) {
         if !self.open {
             return;
         }
         let mut add = false;
-        egui::Window::new(texts::ADD_MARKER_WINDOW_TITLE)
+        egui::Window::new(texts::add_marker_window_title(locale))
             .id(egui::Id::new("add_marker_dialog"))
             .collapsible(false)
             .resizable(false)
@@ -323,41 +337,49 @@ impl AddMarkerDialog {
                     ui.selectable_value(
                         &mut self.shape,
                         MarkerShape::Text,
-                        texts::MARKER_SHAPE_TEXT,
+                        texts::marker_shape_text(locale),
                     );
                     ui.selectable_value(
                         &mut self.shape,
                         MarkerShape::Arrow,
-                        texts::MARKER_SHAPE_ARROW,
+                        texts::marker_shape_arrow(locale),
                     );
                 });
                 ui.add_space(4.0);
                 match self.shape {
                     MarkerShape::Text => {
-                        xyz_row(ui, texts::MARKER_ANCHOR, &mut self.anchor, self.speed);
+                        xyz_row(
+                            ui,
+                            texts::marker_anchor(locale),
+                            &mut self.anchor,
+                            self.speed,
+                        );
                         ui.horizontal(|ui| {
-                            ui.label(texts::MARKER_TEXT);
+                            ui.label(texts::marker_text(locale));
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.text)
-                                    .hint_text(texts::MARKER_TEXT_HINT)
+                                    .hint_text(texts::marker_text_hint(locale))
                                     .desired_width(180.0),
                             );
                         });
                     }
                     MarkerShape::Arrow => {
-                        xyz_row(ui, texts::MARKER_START, &mut self.start, self.speed);
-                        xyz_row(ui, texts::MARKER_END, &mut self.end, self.speed);
+                        xyz_row(ui, texts::marker_start(locale), &mut self.start, self.speed);
+                        xyz_row(ui, texts::marker_end(locale), &mut self.end, self.speed);
                     }
                 }
                 // A text label with empty text would be invisible in the
-                // viewport (and uneditable in the scene, spec §5 non-goal),
-                // so Add waits for actual text.
+                // viewport (and uneditable in the scene, display-types spec
+                // §5 non-goal), so Add waits for actual text.
                 let has_label_text =
                     self.shape != MarkerShape::Text || !self.text.trim().is_empty();
                 ui.add_space(4.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add_enabled(has_label_text, egui::Button::new(texts::ADD_OBJECT_BUTTON))
+                        .add_enabled(
+                            has_label_text,
+                            egui::Button::new(texts::add_object_button(locale)),
+                        )
                         .clicked()
                     {
                         add = true;
