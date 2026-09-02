@@ -11,8 +11,10 @@ rendering robot sensor data, scene frames, and computation graphs in an interact
 ![CI](https://github.com/DoraRobot/RoboView/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-informational)
 
-> **_Status:_** Early phase. The project foundation (standards, language policy)
-> is ratified; architecture design has not started yet. Breaking changes are expected.
+> **_Status:_** Early phase. The foundation (standards, language policy) and the
+> rendering/GUI stack (ADR 006) are ratified; the first feature slice — opening
+> and viewing point clouds (PLY/PCD) in a GPU viewport — works. Breaking changes
+> are still expected.
 
 ## Highlights (planned)
 
