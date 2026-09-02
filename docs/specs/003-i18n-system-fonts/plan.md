@@ -4,7 +4,7 @@
 
 日期：2026-09-02
 
-相关：`spec.md`（Approved）；ADR 004、ADR 006；`docs/specs/display-types/`（texts.rs 现结构）
+相关：`spec.md`（Approved）；ADR 004、ADR 006；`docs/specs/002-display-types/`（texts.rs 现结构）
 
 修订记录：2026-09-02 起草；经负责人评审通过（In Review → Approved）。
 

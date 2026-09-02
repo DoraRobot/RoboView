@@ -4,12 +4,12 @@
 
 日期：2026-09-02
 
-修订：2026-09-02（四视角评审后全面修订；负责人裁定 4 项决策已落位正文：D1 自研 fontdb、locale 显式注入、CI 预装 CJK 字体、display-types 祖父例外不占 002 号；2026-09-02 负责人定稿批准：In Review → Approved，§7 已裁定节删除并落位正文）
+修订：2026-09-02（四视角评审后全面修订；负责人裁定 4 项决策已落位正文：D1 自研 fontdb、locale 显式注入、CI 预装 CJK 字体、display-types 功能完成后追溯改名为 002-display-types；2026-09-02 负责人定稿批准：In Review → Approved，§7 已裁定节删除并落位正文）
 
-相关：ADR 004（SDD 工作区）、ADR 006（技术栈）、`docs/specs/display-types/`（已实现：`texts.rs` 文案集中，§6.5）、`docs/specs/001-point-cloud-viewport/`（性能协议 A11 基线）
+相关：ADR 004（SDD 工作区）、ADR 006（技术栈）、`docs/specs/002-display-types/`（已实现：`texts.rs` 文案集中，§6.5）、`docs/specs/001-point-cloud-viewport/`（性能协议 A11 基线）
 
 > 跨 workspace 引用全限定（docs/README 约定，本文件从之）：`001-point-cloud-viewport spec.md A9`、
-> `docs/specs/display-types/spec.md A1–A12`；裸编号仅本 workspace 有效。
+> `docs/specs/002-display-types/spec.md A1–A12`；裸编号仅本 workspace 有效。
 
 ## 1. 问题陈述
 
@@ -17,7 +17,7 @@
 
 1. **字形覆盖**：egui 默认字体链（拉丁/emoji/图标子集）不含 `→`（U+2192）——display-types 的
    提示文案已因此出现豆腐块（已用 ASCII 临时规避）；中文等非拉丁文案将系统性遇到同类缺失
-   （CJK 缺口是符号的百倍规模：display-types spec 的 marker 标签是用户数据，任何 locale 下都可能含中文）。
+   （CJK 缺口是符号的百倍规模：002-display-types spec 的 marker 标签是用户数据，任何 locale 下都可能含中文）。
 2. **文案硬编码英文**：`texts.rs` 集中但无 locale 概念与切换机制。
 
 本功能把"文案层 i18n 骨架"与"字体层系统字体"一次落地：**应用文案支持 en/zh-CN
@@ -65,7 +65,7 @@
 - 不修改 core：i18n/字体全部在 app 层（core 零文案层、零字体；既有不变式保持）。
 - 不翻机器诊断细节（core `reason`、`std::io::Error` 文本恒定原语言——见 §6 分层）。
 - **范围锁定**：任何调整（如改打包字体、新增 locale、引入第三语言）须修订本规格并重新批准（同
-  `docs/specs/display-types/spec.md` 范围锁定先例）。
+  `docs/specs/002-display-types/spec.md` 范围锁定先例）。
 
 ## 6. 约束
 
@@ -102,7 +102,7 @@
 - `TextKey` 枚举（约 46 键）+ `resolve(locale, key) -> &'static str`（zh 缺失 → En + 去重 warn once）
   + snake_case 零参 getter 包装（调用点机械改造约 44 层）。
 - **不变量集合**（恒为英文 const，不翻译）：`WINDOW_TITLE`（RoboView）、`AXIS_X/Y/Z`
-  （display-types spec 锁定）、`🗑` 图标、**生成名模板**（`Frame {N}`/`Marker {N}`——生成即
+  （002-display-types spec 锁定）、`🗑` 图标、**生成名模板**（`Frame {N}`/`Marker {N}`——生成即
   数据，切换不翻译既有名）；`ViewportState` 零 locale 依赖。
 - D4 翻译清单（以现有英文为准逐条中文）：可翻译 const（约 41）+ 错误模板（约 11 句，
   整句作为翻译单元、占位符原位替换）+ 语言菜单（3-4 条）≈ 55-60 项。

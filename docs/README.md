@@ -50,9 +50,6 @@ directory mirroring the same structure ([ADR 001](decisions/001-doc-localization
 - SDD feature workspaces are named `NNN-<kebab-name>` with a zero-padded
   3-digit sequence (`001-`, `002-`, …) in creation order; sequences stay
   unique and incrementing, old workspaces keep their number.
-- Grandfathered exception: `display-types` predates the naming rule and
-  keeps its name (approved docs reference it by path); the numbering gap
-  (001 → 003) is intentional and must not be back-filled.
 - SDD workspace headers (spec/plan/tasks) update their status together on
   every status transition.
 

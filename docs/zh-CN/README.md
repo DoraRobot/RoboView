@@ -46,9 +46,6 @@
 - `docs/` 中每篇文档随创建同步提供 `zh-CN` 翻译，存放于同一相对路径（语言树允许稀疏，§1.7——本项目保持译文处于最新）；`docs/specs/` 除外（ADR 004）。
 - 跨 workspace 引用必须全限定：如 `001-point-cloud-viewport spec.md A7`；裸编号（如 A7）只在当前 workspace 内有效。
 - SDD 功能工作区以 `NNN-<kebab 名>` 命名，`NNN-` 为三位零填充序号（`001-`、`002-`…），按创建顺序递增；序号保持唯一且递增，旧工作区不改号。
-- 祖父例外：`display-types` 早于本命名规则，保留原名称（已批准文档按路径引用）；编号缺口（001 → 003）为有意为之，不得回填。
-- SDD workspace 的 spec/plan/tasks 三个头部状态在一次状态变更中同步更新。
-
 ## 流程（简述）
 
 1. 在 `plans/YYYY-MM-DD-<主题>.md` 建立 `Draft` 方案。
