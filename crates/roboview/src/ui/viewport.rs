@@ -9,10 +9,10 @@
 //!    frame and pointer input mutates the camera, then — when a cloud is
 //!    active — one [`egui_wgpu::Callback`] is registered inside the frame's
 //!    shape list.
-//! 2. egui-wgpu later calls [`ViewportCallback::prepare`] for every such
+//! 2. egui-wgpu later calls `ViewportCallback::prepare` for every such
 //!    shape: it locks the state, recomputes the view-projection from the
 //!    stored rect of this same frame, and writes the mesh uniform.
-//! 3. During the render pass [`ViewportCallback::paint`] locks the state
+//! 3. During the render pass `ViewportCallback::paint` locks the state
 //!    again and records the draw of the active cloud.
 //!
 //! The state lives behind an `Arc<Mutex<…>>` because the callback objects
@@ -48,7 +48,7 @@ pub fn lock_state(state: &Arc<Mutex<ViewportState>>) -> MutexGuard<'_, ViewportS
 pub struct ViewportState {
     scene: scene::Scene<displays::PointCloud>,
     /// Renderer for the current target format; `None` before the first
-    /// frame in which eframe exposes its wgpu [`RenderState`]
+    /// frame in which eframe exposes its wgpu `RenderState`
     /// (egui_wgpu::RenderState), i.e. before any GPU work is possible.
     renderer: Option<render::Renderer>,
     /// Viewport rect of the frame currently being built, in points.

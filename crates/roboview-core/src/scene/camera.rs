@@ -97,8 +97,8 @@ pub struct OrbitCamera {
 }
 
 impl OrbitCamera {
-    /// A camera with the default pose (yaw 0, pitch [`DEFAULT_PITCH`],
-    /// distance [`DEFAULT_DISTANCE`]) aimed at `target`.
+    /// A camera with the default pose (yaw 0, pitch `DEFAULT_PITCH`,
+    /// distance `DEFAULT_DISTANCE`) aimed at `target`.
     pub fn new(target: Vec3) -> Self {
         Self {
             target,
@@ -114,12 +114,12 @@ impl OrbitCamera {
     /// spec G1).
     ///
     /// - Some bounds: target = box center; distance = `1.5·largest_dimension`
-    ///   plus [`FRAMING_MARGIN`], so the eye sits comfortably outside the
+    ///   plus `FRAMING_MARGIN`, so the eye sits comfortably outside the
     ///   content and a degenerate or all-identical box (extent 0, single
-    ///   point) frames its center at [`DEFAULT_DISTANCE`] instead of
+    ///   point) frames its center at `DEFAULT_DISTANCE` instead of
     ///   deriving a zero distance.
     /// - `None`, or bounds that are not finite (hand-built garbage): origin
-    ///   and [`DEFAULT_DISTANCE`].
+    ///   and `DEFAULT_DISTANCE`.
     pub fn framing(bounds: Option<&Aabb>) -> Self {
         let Some(bounds) = bounds else {
             return Self::new(Vec3::ZERO);
