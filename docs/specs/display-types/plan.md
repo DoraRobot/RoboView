@@ -1,10 +1,12 @@
 # display-types — 方案
 
-状态：Draft（草案）
+状态：Approved（已批准）
 
 日期：2026-09-02
 
 相关：`spec.md`（Approved）；ADR 004、ADR 006；首功能 `docs/specs/point-cloud-viewport/`（plan.md §3.2 契约修订参见本文 §7 风险表）
+
+修订记录：2026-09-02 起草；经负责人评审无异议批准（In Review → Approved）。
 
 ## 1. 概述
 
