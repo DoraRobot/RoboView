@@ -39,6 +39,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      # Spec 003 A2: the font probe assertions need a CJK-capable font on
+      # the Linux runner (macOS/Windows runners ship their own).
+      - name: Install CJK fonts
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
       - run: cargo test --workspace --all-targets
 
   msrv:
