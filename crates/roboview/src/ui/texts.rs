@@ -21,7 +21,7 @@ pub const MENU_FILE: &str = "File";
 pub const MENU_OPEN_POINT_CLOUD: &str = "Open point cloud file…";
 
 /// Hint shown in the center of the viewport while no cloud is loaded.
-pub const VIEWPORT_EMPTY_HINT: &str = "Open a point cloud file to begin (File → Open…)";
+pub const VIEWPORT_EMPTY_HINT: &str = "Open a point cloud file to begin (File > Open…)";
 
 /// Shown in the viewport while a file loads in the background.
 pub const VIEWPORT_LOADING: &str = "Loading point cloud…";
