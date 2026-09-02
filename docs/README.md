@@ -14,7 +14,7 @@ directory mirroring the same structure ([ADR 001](decisions/001-doc-localization
 | Directory | Purpose |
 |---|---|
 | `plans/` | Project-level plans: governance changes, milestones, architecture direction |
-| `specs/` | Feature-level SDD workspace — Chinese work documents, no mirror (ADR 004) |
+| `specs/` | Feature-level SDD workspaces `NNN-<kebab-name>` (`001-`, `002-`, …); Chinese work documents, no mirror (ADR 004) |
 | `design/` | Architecture & detailed design documents |
 | `decisions/` | ADRs: `NNN-title.md`, numbered, immutable once approved |
 | `zh-CN/` | Chinese language tree — mirror of the above, only translated docs |

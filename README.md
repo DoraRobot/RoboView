@@ -12,9 +12,10 @@ rendering robot sensor data, scene frames, and computation graphs in an interact
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-informational)
 
 > **_Status:_** Early phase. The foundation (standards, language policy) and the
-> rendering/GUI stack (ADR 006) are ratified; the first feature slice — opening
-> and viewing point clouds (PLY/PCD) in a GPU viewport — works. Breaking changes
-> are still expected.
+> rendering/GUI stack (ADR 006) are ratified. Two feature slices work: opening
+> and viewing point clouds (PLY/PCD), and the multi-object scene — point clouds
+> plus meshes (OBJ), paths, coordinate frames and markers with a sidebar list.
+> UI localization (en / zh-CN) is in progress. Breaking changes are still expected.
 
 ## Highlights (planned)
 
@@ -61,7 +62,8 @@ Requires the stable Rust toolchain (see the workspace `Cargo.toml` for the versi
 │           └── displays/  # Display-type traits & built-in display types
 ├── docs/
 │   ├── README.md          # Documentation index & conventions (English)
-│   ├── plans/             # Feature proposals & implementation plans
+│   ├── plans/             # Project-level plans (governance, milestones)
+│   ├── specs/             # Feature-level SDD workspaces NNN-<name> (Chinese)
 │   ├── design/            # Architecture & detailed design documents
 │   ├── decisions/         # Architecture Decision Records (ADR)
 │   └── zh-CN/             # Chinese language tree (mirrors of translated docs)
