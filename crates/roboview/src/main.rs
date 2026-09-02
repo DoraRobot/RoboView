@@ -1,20 +1,27 @@
 //! RoboView desktop shell: an eframe/egui application hosting the 3D point
-//! cloud viewport (spec `docs/specs/point-cloud-viewport/`).
+//! cloud viewport.
 //!
-//! Layout of the frame (`App::update`, plan §3.3):
+//! Opening files appends to the scene (display-types spec §1 replaces the
+//! first feature's single-slot swap, `docs/specs/point-cloud-viewport/`):
+//! each successful load adds one object named by its file stem, the first
+//! object of an empty scene frames the scene bounds, later adds never move
+//! the camera (spec §6). Failure keeps every existing object and surfaces
+//! a readable error (spec A10).
+//!
+//! Layout of the frame (`App::update`, display-types plan §3.4):
 //!
 //! 1. Align the point cloud renderer with eframe's wgpu render state
 //!    (created once it exists, rebuilt when the target format changes).
 //! 2. Poll the background loader channel; a finished file becomes pending
-//!    data, a failure keeps the current cloud and shows an error window.
+//!    data, a failure keeps the current objects and shows an error window.
 //! 3. Install pending data once a renderer exists (single-flight; upload
-//!    and scene swap happen here, on the UI thread).
+//!    and scene add happen here, on the UI thread).
 //! 4. Draw the menu bar (File → Open point cloud file…), the central
 //!    viewport panel, and the non-modal error notification.
 //!
-//! Loading never blocks the UI thread (spec A7): the dialog choice spawns a
-//! worker thread that parses the file and reports back over an mpsc
-//! channel; the worker asks egui for a repaint when it finishes.
+//! Loading never blocks the UI thread: the dialog choice spawns a worker
+//! thread that parses the file and reports back over an mpsc channel; the
+//! worker asks egui for a repaint when it finishes.
 
 mod ui;
 
@@ -31,14 +38,28 @@ use ui::viewport::{self, ViewportState};
 
 /// Result of one background load, sent over the loader channel.
 enum LoadOutcome {
-    /// The file parsed; the data is ready for upload on the UI thread.
-    Loaded(io::PointCloudData),
-    /// The file could not be loaded; the scene stays untouched (spec A7).
+    /// The file parsed; the data and its display name (file stem) are
+    /// ready for the scene add on the UI thread.
+    Loaded {
+        /// Display name of the new scene object (file stem, display-types
+        /// plan §3.1).
+        name: String,
+        data: io::PointCloudData,
+    },
+    /// The file could not be loaded; the scene stays untouched (spec A10).
     Failed {
         /// File name for the human-readable error window.
         file: String,
         error: PointCloudError,
     },
+}
+
+/// A successfully parsed file waiting for renderer-side install.
+struct PendingCloud {
+    /// Display name of the object to add (file stem).
+    name: String,
+    /// Parsed point data, ready to upload.
+    data: io::PointCloudData,
 }
 
 /// The RoboView application: window shell + viewport state.
@@ -50,7 +71,7 @@ struct RoboViewApp {
     /// depends on eframe's wgpu render state being available, which it is
     /// from the first frame on native; the fallback keeps this slot for a
     /// frame where it is not.
-    pending_cloud: Option<io::PointCloudData>,
+    pending_cloud: Option<PendingCloud>,
     /// In-flight background load. `Some` also drives the single-flight
     /// guard that disables the Open menu item while a load runs.
     load: Option<Receiver<LoadOutcome>>,
@@ -93,6 +114,14 @@ impl RoboViewApp {
         let (sender, receiver) = mpsc::channel::<LoadOutcome>();
         let context = ctx.clone();
         let file = path.to_string_lossy().into_owned();
+        // Display name of the new scene object: the file stem ("scene.ply"
+        // -> "scene"). Fall back to the file name for files without a stem
+        // (e.g. dotfiles), which the open dialog may still pick.
+        let name = path
+            .file_stem()
+            .or_else(|| path.file_name())
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
         match std::thread::Builder::new()
             .name("point-cloud-loader".to_owned())
             .spawn(move || {
@@ -103,7 +132,7 @@ impl RoboViewApp {
                             points = data.point_count(),
                             "point cloud file loaded"
                         );
-                        LoadOutcome::Loaded(data)
+                        LoadOutcome::Loaded { name, data }
                     }
                     Err(error) => {
                         tracing::warn!(file = %path.display(), %error, "point cloud load failed");
@@ -128,16 +157,16 @@ impl RoboViewApp {
 
     /// Poll the loader channel and turn its outcome into state: loaded
     /// data moves to the pending slot (installed later in the same frame,
-    /// after this function returns), a failure keeps the current cloud and
-    /// surfaces the error window.
+    /// after this function returns), a failure keeps the current objects
+    /// and surfaces the error window.
     fn poll_background_load(&mut self) {
         let Some(receiver) = &self.load else {
             return;
         };
         match receiver.try_recv() {
-            Ok(LoadOutcome::Loaded(data)) => {
+            Ok(LoadOutcome::Loaded { name, data }) => {
                 self.load = None;
-                self.pending_cloud = Some(data);
+                self.pending_cloud = Some(PendingCloud { name, data });
             }
             Ok(LoadOutcome::Failed { file, error }) => {
                 self.load = None;
@@ -155,13 +184,19 @@ impl RoboViewApp {
     /// [`ViewportState::install_cloud`]); a successful install clears any
     /// stale error from an earlier failed load.
     fn install_pending_cloud(&mut self) {
-        if let Some(data) = &self.pending_cloud {
-            let installed = viewport::lock_state(&self.viewport).install_cloud(data);
-            if installed {
-                tracing::info!(points = data.point_count(), "point cloud installed");
-                self.pending_cloud = None;
-                self.error_message = None;
-            }
+        let Some(pending) = &self.pending_cloud else {
+            return;
+        };
+        let installed =
+            viewport::lock_state(&self.viewport).install_cloud(&pending.data, &pending.name);
+        if installed {
+            tracing::info!(
+                name = %pending.name,
+                points = pending.data.point_count(),
+                "point cloud added to the scene"
+            );
+            self.pending_cloud = None;
+            self.error_message = None;
         }
     }
 
