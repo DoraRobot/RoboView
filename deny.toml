@@ -1,0 +1,36 @@
+# cargo-deny configuration (see CONSTITUTION §2.8.3, §6.4 and ADR 005).
+# The allowlist matches the project's permissive licensing policy.
+
+[graph]
+all-features = false
+
+[advisories]
+# Vulnerability and unsound advisories are checked unconditionally in
+# cargo-deny 0.18+; the scope fields select which dependency kinds apply.
+unsound = "all"
+yanked = "warn"
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MIT-0",
+]
+confidence-threshold = 0.8
+
+[bans]
+wildcards = "deny"
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"

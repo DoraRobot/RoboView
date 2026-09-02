@@ -1,0 +1,16 @@
+/target
+
+# Private conversation archive (never committed)
+.leon/
+
+# OS noise
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+
+# Logs / artifacts
+*.log
+*.profraw

@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["crates/roboview", "crates/roboview-core"]
+default-members = ["crates/roboview"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Cross-platform 3D data visualization tool for robotics and AI data"
+repository = "https://github.com/DoraRobot/RoboView"
+keywords = ["robotics", "visualization", "point-cloud", "3d", "data"]
+categories = ["visualization"]
