@@ -23,7 +23,7 @@ use super::DisplayKind;
 
 /// An overlay text label anchored at a world-space point (spec §7 F4).
 ///
-/// This is data only — no GPU handle. The app projects [`anchor`] through
+/// This is data only — no GPU handle. The app projects `anchor` through
 /// [`render::anchor_to_screen`] and paints the text with its egui painter,
 /// so the label always sits on top of the scene and never occludes or is
 /// occluded by it (spec §6 overlay policy).

@@ -154,7 +154,7 @@ pub const ERROR_WINDOW_TITLE: &str = "Error";
 /// Notification when a chosen file cannot be loaded. Spec A10 keeps every
 /// previously loaded object on screen — the scene is untouched on failure,
 /// this message is the only reaction. The detail line is a per-variant
-/// mapping of the typed [`io::LoadError`] tree, so core's own error strings
+/// mapping of the typed `io::LoadError` tree, so core's own error strings
 /// never reach the UI.
 pub fn load_failed(file_name: &str, error: &LoadError) -> String {
     format!(
@@ -163,7 +163,7 @@ pub fn load_failed(file_name: &str, error: &LoadError) -> String {
     )
 }
 
-/// One readable line per [`io::LoadError`] variant family.
+/// One readable line per `io::LoadError` variant family.
 fn describe_load_error(error: &LoadError) -> String {
     match error {
         LoadError::UnsupportedFormat { extension } => unsupported_format(extension),

@@ -2,7 +2,7 @@
 //! (paths), coordinate axes (frames), and marker arrows, drawn as
 //! `LineStrip` runs.
 //!
-//! The upload side takes CPU geometry as colored strips ([`CpuStrip`]) and
+//! The upload side takes CPU geometry as colored strips (`CpuStrip`) and
 //! packs them into one positions buffer and one per-vertex sRGB color buffer
 //! (the same packed layout the point pipeline uses, decoded and converted to
 //! linear light in the shader). Each strip is one `LineStrip` primitive, so
@@ -233,7 +233,8 @@ fn pack_strips(strips: &[CpuStrip]) -> (Vec<u8>, Vec<u8>, Vec<(u32, u32)>) {
 /// color buffers plus the bind group referencing the renderer's scene-wide
 /// view-projection uniform buffer. Owned by the caller (a path, frame, or
 /// marker-arrow display behind an [`Arc`]); dropping it frees the buffers
-/// through wgpu's deferred destruction, exactly like [`PointCloudMesh`].
+/// through wgpu's deferred destruction, exactly like
+/// [`crate::render::renderer::PointCloudMesh`] (`renderer` module).
 pub struct LineMesh {
     positions: wgpu::Buffer,
     colors: wgpu::Buffer,
