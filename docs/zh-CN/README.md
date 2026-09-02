@@ -44,6 +44,8 @@
 - 按读者一无所知的标准写作：说明问题、候选方案、决策与理由。
 - 属设计层面的代码改动，必须在 PR 描述中链接对应文档。
 - `docs/` 中每篇文档随创建同步提供 `zh-CN` 翻译，存放于同一相对路径（语言树允许稀疏，§1.7——本项目保持译文处于最新）；`docs/specs/` 除外（ADR 004）。
+- 跨 workspace 引用必须全限定：如 `point-cloud-viewport spec.md A7`；裸编号（如 A7）只在当前 workspace 内有效。
+- SDD workspace 的 spec/plan/tasks 三个头部状态在一次状态变更中同步更新。
 
 ## 流程（简述）
 

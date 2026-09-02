@@ -45,6 +45,10 @@ directory mirroring the same structure ([ADR 001](decisions/001-doc-localization
 - Every document in `docs/` ships with its `zh-CN` translation at the same
   relative path (sparse trees are allowed, §1.7; this project keeps
   translations current). `docs/specs/` is exempt (ADR 004).
+- Cross-workspace references are fully qualified: `point-cloud-viewport
+  spec.md A7`; a bare `A7` is local to the current workspace only.
+- SDD workspace headers (spec/plan/tasks) update their status together on
+  every status transition.
 
 ## Languages
 
