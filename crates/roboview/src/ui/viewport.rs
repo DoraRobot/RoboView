@@ -116,6 +116,10 @@ impl ViewportState {
             Arc::new(device.clone()),
             Arc::new(queue.clone()),
             target_format,
+            // egui-wgpu attaches Depth24Plus when depth_buffer=24 is set in
+            // NativeOptions; pipeline and pass must agree exactly.
+            wgpu::TextureFormat::Depth24Plus,
+            1,
         );
         // Re-upload every object so each GPU handle comes from the rebuilt
         // renderer (and from the same device if eframe ever switches
@@ -187,7 +191,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
     fn prepare(
         &self,
         _device: &wgpu::Device,
-        _queue: &wgpu::Queue,
+        queue: &wgpu::Queue,
         _screen_descriptor: &egui_wgpu::ScreenDescriptor,
         _egui_encoder: &mut wgpu::CommandEncoder,
         _callback_resources: &mut egui_wgpu::CallbackResources,
@@ -196,18 +200,12 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         let Some(renderer) = state.renderer.as_ref() else {
             return Vec::new();
         };
-        let Some(object) = state.scene.last() else {
-            return Vec::new();
-        };
-        let Some(mesh) = object.object.mesh.as_ref() else {
-            return Vec::new();
-        };
-        // Uniforms must be written in prepare: this is the only callback
-        // stage with a queue. The aspect comes from the viewport rect that
-        // `show_viewport` recorded for this same frame (update runs before
-        // the callbacks, so the rect is never stale).
+        // The shared view-proj uniform is written once per frame in prepare
+        // (the only callback stage with a queue). The aspect comes from the
+        // viewport rect that `show_viewport` recorded for this same frame
+        // (update runs before the callbacks, so the rect is never stale).
         let view_proj = state.scene.camera.view_proj(state.aspect());
-        renderer.prepare_uniform(mesh, view_proj);
+        renderer.update_uniform(queue, view_proj);
         Vec::new()
     }
 

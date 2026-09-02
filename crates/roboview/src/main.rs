@@ -283,6 +283,10 @@ fn main() {
             .with_inner_size(egui::vec2(1280.0, 800.0))
             .with_min_inner_size(egui::vec2(480.0, 360.0)),
         renderer: eframe::Renderer::Wgpu,
+        // Shared depth (display-types spec §6): egui-wgpu attaches a
+        // Depth24Plus attachment to its pass — all scene pipelines must be
+        // built with the same format and sample count.
+        depth_buffer: 24,
         ..Default::default()
     };
 
