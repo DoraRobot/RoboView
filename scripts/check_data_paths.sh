@@ -6,7 +6,7 @@
 # path literal ending in .ply/.pcd in production code fails the guard.
 set -u
 
-hits=$(grep -rnE "[\"'][^\"']*\.(ply|pcd)['\"]" crates/*/src --include='*.rs' | grep -vE "^\S+:[0-9]+:[[:space:]]*//" || true)
+hits=$(grep -rnE "[\"'][^\"']*\.(ply|pcd|obj|csv|xyz)['\"]" crates/*/src --include='*.rs' | grep -vE "^\S+:[0-9]+:[[:space:]]*//" || true)
 
 if [ -n "$hits" ]; then
     echo "A9 violation: hardcoded data file path(s) found:"

@@ -20,6 +20,7 @@ use std::path::Path;
 
 use glam::Vec3;
 
+use super::ascii_text::{self, LineIter};
 use super::{Aabb, Color, Format, PointCloudData, PointCloudError};
 
 /// The scalar types of the PLY type table, with their on-disk sizes.
@@ -260,10 +261,7 @@ fn parse_header(bytes: &[u8]) -> Result<Header, PointCloudError> {
         if line.last() == Some(&b'\r') {
             line = &line[..line.len() - 1];
         }
-        let tokens: Vec<&[u8]> = line
-            .split(|b| b.is_ascii_whitespace())
-            .filter(|token| !token.is_empty())
-            .collect();
+        let tokens = ascii_text::ws_tokens(line);
 
         if first_line {
             first_line = false;
@@ -299,10 +297,7 @@ fn parse_header(bytes: &[u8]) -> Result<Header, PointCloudError> {
                             )));
                         }
                     });
-                    let version = std::str::from_utf8(tokens[2])
-                        .map_err(|_| malformed("PLY header: invalid format version"))?;
-                    version
-                        .parse::<f32>()
+                    ascii_text::parse_number::<f32>(tokens[2])
                         .map_err(|_| malformed("PLY header: invalid format version"))?;
                 }
                 b"element" => {
@@ -313,13 +308,16 @@ fn parse_header(bytes: &[u8]) -> Result<Header, PointCloudError> {
                     }
                     let name = String::from_utf8(tokens[1].to_vec())
                         .map_err(|_| malformed("PLY header: element name is not valid UTF-8"))?;
-                    let count_text = std::str::from_utf8(tokens[2])
-                        .map_err(|_| malformed("PLY header: invalid element count"))?;
-                    let count: u64 = count_text.parse().map_err(|_| {
-                        malformed(format!(
-                            "PLY header: invalid element count \"{count_text}\""
-                        ))
-                    })?;
+                    let count: u64 =
+                        ascii_text::parse_number(tokens[2]).map_err(|error| match error {
+                            ascii_text::NumberTokenError::NotUtf8 => {
+                                malformed("PLY header: invalid element count")
+                            }
+                            ascii_text::NumberTokenError::Invalid => malformed(format!(
+                                "PLY header: invalid element count \"{}\"",
+                                String::from_utf8_lossy(tokens[2])
+                            )),
+                        })?;
                     elements.push(ElementHeader {
                         name,
                         count,
@@ -645,10 +643,7 @@ fn read_ascii_vertices(
                 "PLY ASCII data: file ends after {record_index} of {count} declared vertex records"
             ))
         })?;
-        let tokens: Vec<&[u8]> = line
-            .split(|b| b.is_ascii_whitespace())
-            .filter(|token| !token.is_empty())
-            .collect();
+        let tokens = ascii_text::ws_tokens(line);
         if tokens.len() != plan.tokens_per_vertex {
             return Err(malformed(format!(
                 "PLY ASCII data: vertex record {record_index} has {} tokens; expected {} (one per declared property)",
@@ -703,55 +698,30 @@ fn decode_binary_scalar(bytes: &[u8], ty: ScalarType) -> Option<f64> {
 
 /// Parse one ASCII token as the declared type, with exact integer range
 /// checking. Non-finite tokens (`nan`/`inf`) parse for float and double
-/// types only, which is how G1 data survives an ASCII round trip.
+/// types only, which is how G1 data survives an ASCII round trip. The
+/// token-level parse comes from the shared [`ascii_text`] helpers; the
+/// messages stay PLY-specific.
 fn decode_ascii_scalar(token: &[u8], ty: ScalarType) -> Result<f64, PointCloudError> {
-    let text = std::str::from_utf8(token)
-        .map_err(|_| malformed("PLY ASCII data: numeric token is not valid UTF-8"))?;
     let kind = ty.keyword();
-    let invalid = || malformed(format!("PLY ASCII data: expected a \"{kind}\" number"));
+    let to_error = |error: ascii_text::NumberTokenError| match error {
+        ascii_text::NumberTokenError::NotUtf8 => {
+            malformed("PLY ASCII data: numeric token is not valid UTF-8")
+        }
+        ascii_text::NumberTokenError::Invalid => {
+            malformed(format!("PLY ASCII data: expected a \"{kind}\" number"))
+        }
+    };
     let value = match ty {
-        ScalarType::Char => text.parse::<i8>().map_err(|_| invalid())? as f64,
-        ScalarType::UChar => text.parse::<u8>().map_err(|_| invalid())? as f64,
-        ScalarType::Short => text.parse::<i16>().map_err(|_| invalid())? as f64,
-        ScalarType::UShort => text.parse::<u16>().map_err(|_| invalid())? as f64,
-        ScalarType::Int => text.parse::<i32>().map_err(|_| invalid())? as f64,
-        ScalarType::UInt => text.parse::<u32>().map_err(|_| invalid())? as f64,
-        ScalarType::Float => text.parse::<f32>().map_err(|_| invalid())? as f64,
-        ScalarType::Double => text.parse::<f64>().map_err(|_| invalid())?,
+        ScalarType::Char => ascii_text::parse_number::<i8>(token).map_err(to_error)? as f64,
+        ScalarType::UChar => ascii_text::parse_number::<u8>(token).map_err(to_error)? as f64,
+        ScalarType::Short => ascii_text::parse_number::<i16>(token).map_err(to_error)? as f64,
+        ScalarType::UShort => ascii_text::parse_number::<u16>(token).map_err(to_error)? as f64,
+        ScalarType::Int => ascii_text::parse_number::<i32>(token).map_err(to_error)? as f64,
+        ScalarType::UInt => ascii_text::parse_number::<u32>(token).map_err(to_error)? as f64,
+        ScalarType::Float => ascii_text::parse_number::<f32>(token).map_err(to_error)? as f64,
+        ScalarType::Double => ascii_text::parse_number::<f64>(token).map_err(to_error)?,
     };
     Ok(value)
-}
-
-/// Body lines without terminators. A trailing `\r` is removed so CRLF files
-/// behave like LF files (plan §5); the last line needs no newline.
-struct LineIter<'a> {
-    rest: &'a [u8],
-}
-
-impl<'a> LineIter<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { rest: bytes }
-    }
-}
-
-impl<'a> Iterator for LineIter<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<&'a [u8]> {
-        if self.rest.is_empty() {
-            return None;
-        }
-        let (line, rest) = match self.rest.iter().position(|&b| b == b'\n') {
-            Some(offset) => (&self.rest[..offset], &self.rest[offset + 1..]),
-            None => (self.rest, &[][..]),
-        };
-        self.rest = rest;
-        Some(if line.last() == Some(&b'\r') {
-            &line[..line.len() - 1]
-        } else {
-            line
-        })
-    }
 }
 
 #[cfg(test)]

@@ -25,6 +25,7 @@ use std::path::Path;
 
 use glam::Vec3;
 
+use super::ascii_text::{self, LineIter};
 use super::{Aabb, Color, Format, PointCloudData, PointCloudError};
 
 /// The 32-bit type codes of PCD v0.7 (I/U/F only; other sizes and the
@@ -188,10 +189,7 @@ fn parse_header(bytes: &[u8]) -> Result<(Header, usize), PointCloudError> {
         if line.is_empty() || line[0] == b'#' {
             continue;
         }
-        let tokens: Vec<&[u8]> = line
-            .split(|b| b.is_ascii_whitespace())
-            .filter(|token| !token.is_empty())
-            .collect();
+        let tokens = ascii_text::ws_tokens(line);
         if tokens.is_empty() {
             continue;
         }
@@ -297,14 +295,15 @@ fn build_header(
             "PCD header: the \"POINTS\" line must be exactly \"POINTS <count>\"",
         ));
     }
-    let point_count: u64 = std::str::from_utf8(&points_text[0])
-        .map_err(|_| malformed("PCD header: invalid \"POINTS\" count"))?
-        .parse()
-        .map_err(|_| {
-            malformed(format!(
+    let point_count: u64 =
+        ascii_text::parse_number(&points_text[0]).map_err(|error| match error {
+            ascii_text::NumberTokenError::NotUtf8 => {
+                malformed("PCD header: invalid \"POINTS\" count")
+            }
+            ascii_text::NumberTokenError::Invalid => malformed(format!(
                 "PCD header: invalid \"POINTS\" count \"{}\"",
                 String::from_utf8_lossy(&points_text[0])
-            ))
+            )),
         })?;
 
     let mut columns = Vec::with_capacity(column_count);
@@ -317,13 +316,9 @@ fn build_header(
                 String::from_utf8_lossy(&type_tokens[index])
             ))
         })?;
-        let size: u64 = std::str::from_utf8(&size_tokens[index])
-            .map_err(|_| malformed("PCD header: invalid SIZE value"))?
-            .parse()
+        let size: u64 = ascii_text::parse_number(&size_tokens[index])
             .map_err(|_| malformed("PCD header: invalid SIZE value"))?;
-        let count: u64 = std::str::from_utf8(&count_tokens[index])
-            .map_err(|_| malformed("PCD header: invalid COUNT value"))?
-            .parse()
+        let count: u64 = ascii_text::parse_number(&count_tokens[index])
             .map_err(|_| malformed("PCD header: invalid COUNT value"))?;
         columns.push(make_column(&name, ty, size, count)?);
     }
@@ -491,16 +486,23 @@ fn read_binary_points(
 
 /// Parse one ASCII token as the declared type, with exact integer range
 /// checking. Non-finite tokens (`nan`/`inf`) parse for float columns only,
-/// which is how G1 data survives an ASCII round trip.
+/// which is how G1 data survives an ASCII round trip. The token-level
+/// parse comes from the shared [`ascii_text`] helpers; the messages stay
+/// PCD-specific.
 fn decode_ascii_scalar(token: &[u8], ty: ColumnType) -> Result<f64, PointCloudError> {
-    let text = std::str::from_utf8(token)
-        .map_err(|_| malformed("PCD ASCII data: numeric value is not valid UTF-8"))?;
     let kind = ty.keyword();
-    let invalid = || malformed(format!("PCD ASCII data: expected a TYPE {kind} number"));
+    let to_error = |error: ascii_text::NumberTokenError| match error {
+        ascii_text::NumberTokenError::NotUtf8 => {
+            malformed("PCD ASCII data: numeric value is not valid UTF-8")
+        }
+        ascii_text::NumberTokenError::Invalid => {
+            malformed(format!("PCD ASCII data: expected a TYPE {kind} number"))
+        }
+    };
     let value = match ty {
-        ColumnType::I => text.parse::<i32>().map_err(|_| invalid())? as f64,
-        ColumnType::U => text.parse::<u32>().map_err(|_| invalid())? as f64,
-        ColumnType::F => text.parse::<f32>().map_err(|_| invalid())? as f64,
+        ColumnType::I => ascii_text::parse_number::<i32>(token).map_err(to_error)? as f64,
+        ColumnType::U => ascii_text::parse_number::<u32>(token).map_err(to_error)? as f64,
+        ColumnType::F => ascii_text::parse_number::<f32>(token).map_err(to_error)? as f64,
     };
     Ok(value)
 }
@@ -512,11 +514,14 @@ fn decode_ascii_scalar(token: &[u8], ty: ColumnType) -> Result<f64, PointCloudEr
 /// Integral floats in `[0, 2^24)` take the value route; everything else is
 /// treated as a bit pattern.
 fn decode_packed_float(token: &[u8]) -> Result<u32, PointCloudError> {
-    let text = std::str::from_utf8(token)
-        .map_err(|_| malformed("PCD ASCII data: numeric value is not valid UTF-8"))?;
-    let value: f32 = text
-        .parse()
-        .map_err(|_| malformed("PCD ASCII data: expected a TYPE F number"))?;
+    let value: f32 = ascii_text::parse_number(token).map_err(|error| match error {
+        ascii_text::NumberTokenError::NotUtf8 => {
+            malformed("PCD ASCII data: numeric value is not valid UTF-8")
+        }
+        ascii_text::NumberTokenError::Invalid => {
+            malformed("PCD ASCII data: expected a TYPE F number")
+        }
+    })?;
     let packed_max = (1u32 << 24) as f32;
     if value.is_finite() && value >= 0.0 && value < packed_max && value.fract() == 0.0 {
         Ok(value as u32)
@@ -551,10 +556,7 @@ fn read_ascii_points(
                 "PCD ASCII data: file ends after {point_index} of {count} declared points"
             ))
         })?;
-        let tokens: Vec<&[u8]> = line
-            .split(|b| b.is_ascii_whitespace())
-            .filter(|token| !token.is_empty())
-            .collect();
+        let tokens = ascii_text::ws_tokens(line);
         if tokens.len() != columns.len() {
             return Err(malformed(format!(
                 "PCD ASCII data: point record {point_index} has {} values; expected {} (one per FIELDS column)",
@@ -588,12 +590,15 @@ fn read_ascii_points(
                     // binary as four file-order bytes but through ASCII as
                     // one packed integer (module docs); both use the same
                     // `0x00RRGGBB` layout here.
-                    let text = std::str::from_utf8(token).map_err(|_| {
-                        malformed("PCD ASCII data: numeric value is not valid UTF-8")
-                    })?;
-                    let value: u32 = text
-                        .parse()
-                        .map_err(|_| malformed("PCD ASCII data: expected a TYPE U number"))?;
+                    let value: u32 =
+                        ascii_text::parse_number(token).map_err(|error| match error {
+                            ascii_text::NumberTokenError::NotUtf8 => {
+                                malformed("PCD ASCII data: numeric value is not valid UTF-8")
+                            }
+                            ascii_text::NumberTokenError::Invalid => {
+                                malformed("PCD ASCII data: expected a TYPE U number")
+                            }
+                        })?;
                     let (r, g, b) = unpack_packed(value);
                     accumulator.r = r;
                     accumulator.g = g;
@@ -608,38 +613,6 @@ fn read_ascii_points(
         store_point(&mut positions, &mut colors, accumulator);
     }
     Ok((positions, colors))
-}
-
-/// Body lines without terminators. A trailing `\r` is removed so CRLF files
-/// behave like LF files (plan §5); the last line needs no newline.
-struct LineIter<'a> {
-    rest: &'a [u8],
-}
-
-impl<'a> LineIter<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { rest: bytes }
-    }
-}
-
-impl<'a> Iterator for LineIter<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<&'a [u8]> {
-        if self.rest.is_empty() {
-            return None;
-        }
-        let (line, rest) = match self.rest.iter().position(|&b| b == b'\n') {
-            Some(offset) => (&self.rest[..offset], &self.rest[offset + 1..]),
-            None => (self.rest, &[][..]),
-        };
-        self.rest = rest;
-        Some(if line.last() == Some(&b'\r') {
-            &line[..line.len() - 1]
-        } else {
-            line
-        })
-    }
 }
 
 #[cfg(test)]
