@@ -209,6 +209,15 @@ struct RoboViewApp {
     /// the non-modal error window keeps showing the event until dismissed
     /// — the two coexist until the 007 message center replaces the window.
     messages: Vec<MessageItem>,
+    /// A12/M9 perf-protocol hooks (004 T18, env-gated debug affordances):
+    /// the procedurally generated demo scene (ROBOVIEW_DEMO_SCENE=1), the
+    /// ids it produced (selection sweep), and the last-second sampling
+    /// stamp.
+    demo_install: Option<Vec<PendingObject>>,
+    demo_ids: Vec<u64>,
+    demo_pickups_added: bool,
+    demo_sweep_next: f64,
+    last_fps_at: f64,
 }
 
 impl RoboViewApp {
@@ -247,6 +256,15 @@ impl RoboViewApp {
             objects_state: ObjectsPanelState::default(),
             status_bar: StatusBar::new(),
             messages: Vec::new(),
+            demo_install: if std::env::var("ROBOVIEW_DEMO_SCENE").is_ok() {
+                Some(demo_pending_objects())
+            } else {
+                None
+            },
+            demo_ids: Vec::new(),
+            demo_pickups_added: false,
+            demo_sweep_next: 0.0,
+            last_fps_at: 0.0,
             #[cfg(target_os = "macos")]
             native_menu_bridge,
         }
@@ -489,6 +507,41 @@ impl RoboViewApp {
     /// only when the renderer is ready, so no loaded data is ever cloned or
     /// dropped by the install fallback.
     fn install_pending_object(&mut self) {
+        // A12/M9 demo-scene hook: install one generated object per frame
+        // through the same path, then the frame + marker once the queue is
+        // empty (the viewport add path takes care of the uploads).
+        if let Some(queue) = &mut self.demo_install {
+            if !queue.is_empty() {
+                if !viewport::lock_state(&self.viewport).renderer_ready() {
+                    return;
+                }
+                let next = queue.remove(0);
+                if viewport::lock_state(&self.viewport).install_object(next.object, &next.name) {
+                    tracing::info!(name = %next.name, "demo scene object added");
+                    if let Some(id) = viewport::lock_state(&self.viewport)
+                        .scene
+                        .iter()
+                        .last()
+                        .map(|o| o.id)
+                    {
+                        self.demo_ids.push(id);
+                    }
+                }
+                return; // one demo install per frame
+            }
+            self.demo_install = None;
+            if !self.demo_pickups_added {
+                self.demo_pickups_added = true;
+                let mut lock = viewport::lock_state(&self.viewport);
+                lock.add_frame(glam::Vec3::new(3.0, 0.0, 0.0), 1.0);
+                lock.add_marker(roboview_core::displays::Marker::Text(
+                    roboview_core::displays::MarkerText {
+                        anchor: glam::Vec3::new(5.0, 1.0, 0.0),
+                        text: "demo marker".to_owned(),
+                    },
+                ));
+            }
+        }
         if self.pending_object.is_none() || !viewport::lock_state(&self.viewport).renderer_ready() {
             return; // Nothing pending, or retry on a later frame.
         }
@@ -856,6 +909,30 @@ impl eframe::App for RoboViewApp {
             .record(std::time::Duration::from_secs_f64(f64::from(
                 ctx.input(|i| i.unstable_dt),
             )));
+        // A12/M9 perf sample (one line per elapsed second, release runs):
+        // the readout exposes the window p95 so the protocol can be
+        // measured from the log; the selection sweep below exercises the
+        // per-object appearance channel (mandatory in the demo scene).
+        let now_secs = ctx.input(|i| i.time);
+        if now_secs - self.last_fps_at >= 1.0 {
+            self.last_fps_at = now_secs;
+            let fps = self.status_bar.fps();
+            let p95_ms = self.status_bar.p95_frame_ms();
+            let lock = viewport::lock_state(&self.viewport);
+            tracing::info!(
+                fps = fps.unwrap_or_default(),
+                p95_ms = p95_ms.unwrap_or_default(),
+                grid = lock.grid_on(),
+                objects = lock.scene.iter().count(),
+                "perf sample (A12)"
+            );
+        }
+        if !self.demo_ids.is_empty() && now_secs - self.demo_sweep_next >= 0.5 {
+            self.demo_sweep_next = now_secs;
+            let idx = (self.demo_sweep_next * 2.0).floor() as usize % self.demo_ids.len();
+            let id = self.demo_ids[idx];
+            viewport::lock_state(&self.viewport).set_selected(Some(id));
+        }
         self.top_region(ctx);
         self.status_bar_panel(ctx);
         self.objects_panel(ctx);
@@ -876,6 +953,75 @@ impl eframe::App for RoboViewApp {
         // gone — A5: the panel's inline forms replace them).
         self.error_window(ctx);
     }
+}
+
+/// A12/M9 demo scene (ROBOVIEW_DEMO_SCENE=1): the spec's acceptance
+/// composite C rendered procedurally — a 1M-point cloud and a 100k-face
+/// mesh — so the perf protocol never needs repository data files (the A9
+/// guard stays untouched). Frame + marker are added at install
+/// (see `install_pending_object`).
+fn demo_pending_objects() -> Vec<PendingObject> {
+    const POINTS: usize = 1_000_000;
+    const GRID: usize = 224; // 224² quads × 2 = 100,352 faces (spec C ≥100k)
+
+    let mut state = 0x9e37_79b9u32;
+    let mut next = move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        state
+    };
+    let mut positions = Vec::with_capacity(POINTS);
+    for _ in 0..POINTS {
+        let x = (next() % 200_000) as f32 / 2_000.0 - 50.0;
+        let y = (next() % 200_000) as f32 / 2_000.0 - 50.0;
+        let z = (next() % 100_000) as f32 / 2_000.0 - 25.0;
+        positions.push(glam::Vec3::new(x, y, z));
+    }
+    let cloud_bounds = io::Aabb::from_points(&positions);
+    let cloud = io::PointCloudData {
+        positions,
+        colors: None,
+        bounds: cloud_bounds,
+        format: io::Format::Ply,
+    };
+
+    let side = GRID as f32 / 2.0;
+    let mut mesh_positions = Vec::with_capacity((GRID + 1) * (GRID + 1));
+    for iy in 0..=GRID {
+        for ix in 0..=GRID {
+            let x = ix as f32 - side;
+            let y = iy as f32 - side;
+            let z = 4.0 * (x * 0.15).sin() * (y * 0.15).cos();
+            mesh_positions.push(glam::Vec3::new(x, y, z));
+        }
+    }
+    let mut indices: Vec<u32> = Vec::with_capacity(GRID * GRID * 6);
+    for iy in 0..GRID {
+        for ix in 0..GRID {
+            let a = (iy * (GRID + 1) + ix) as u32;
+            let b = a + 1;
+            let c = a + (GRID as u32 + 1);
+            let d = c + 1;
+            indices.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+    let mesh_bounds = io::Aabb::from_points(&mesh_positions);
+    let mesh = io::MeshData {
+        positions: mesh_positions,
+        normals: None,
+        indices: Some(indices),
+        bounds: mesh_bounds,
+    };
+
+    vec![
+        PendingObject {
+            name: "demo-points-1m".to_owned(),
+            object: io::LoadedObject::PointCloud(cloud),
+        },
+        PendingObject {
+            name: "demo-mesh-100k".to_owned(),
+            object: io::LoadedObject::Mesh(mesh),
+        },
+    ]
 }
 
 /// The display kind of a loaded object (group-default color injection,

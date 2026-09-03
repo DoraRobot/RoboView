@@ -70,16 +70,6 @@
 //! time (`HH:MM:SS`) — deterministic and unit-testable; locale-aware
 //! wall-clock rendering belongs to the 007 message center.
 
-// # Dead-code note (delete as the module gets wired)
-//!
-//! The app crate is a binary, so rustc's `dead_code` analysis has no
-//! external-interface notion for this module: until the 004 T15
-//! integration commit calls [`StatusBar::ui`] from main.rs, every public
-//! item here is unreachable from `main` and would warn on every build. The
-//! module-wide allow below is the single point to remove once the wiring
-//! lands.
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -176,6 +166,20 @@ impl StatusBar {
             return None;
         }
         Some(self.frame_seconds.len() as f32 / total)
+    }
+
+    /// 95th-percentile frame time of the current window, milliseconds (the
+    /// A12/M9 readout: release measuring of the interactive frame time over
+    /// the sliding window; None while no sample exists).
+    #[allow(dead_code)] // wired by the main.rs perf-sample hook (T18)
+    pub fn p95_frame_ms(&self) -> Option<f32> {
+        let mut samples: Vec<f32> = self.frame_seconds.iter().copied().collect();
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = (samples.len() - 1) * 95 / 100;
+        Some(samples[idx] * 1000.0)
     }
 
     /// Draw the bottom status band: the message strip (when messages
@@ -282,6 +286,7 @@ pub struct MessageItem {
 
 /// Severity of a [`MessageItem`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Warning reserved: no warning source in 004 (007 message center)
 pub enum MessageLevel {
     /// A failure (the strip colors it with the theme's error color).
     Error,
@@ -335,6 +340,7 @@ pub struct StatusInfo<'a> {
 /// `None` for an empty window or when the total time is zero or not finite
 /// (no sample, or every duration zero: division is undefined). Never
 /// panics, never returns a non-finite value.
+#[allow(dead_code)] // pure helper, consumed by the unit tests
 pub fn fps_from_frame_seconds(samples: &[f32]) -> Option<f32> {
     if samples.is_empty() {
         return None;

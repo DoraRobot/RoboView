@@ -336,7 +336,9 @@ impl ViewportState {
             appearances: HashMap::new(),
             selected_mirror: None,
             group_default_colors: HashMap::new(),
-            grid_on: true,
+            // A12 perf-protocol hook (004 T18): ROBOVIEW_DEMO_GRID_OFF=1
+            // starts with the ground grid hidden for the on/off comparison.
+            grid_on: std::env::var("ROBOVIEW_DEMO_GRID_OFF").is_err(),
             axes_on: true,
             grid_mesh: None,
             axes_meshes: None,
