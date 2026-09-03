@@ -56,6 +56,7 @@
 //! the pipeline objects, and dropping a display drops its handle, freeing
 //! the buffers through wgpu's deferred destruction semantics.
 
+pub mod grid;
 pub mod camera_math;
 pub mod counters;
 pub mod line;
