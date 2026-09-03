@@ -54,7 +54,8 @@ pub fn screen_to_ray(view_proj: &Mat4, viewport_size: Vec2, pos: Vec2) -> Option
 pub fn pointer_world(view_proj: &Mat4, viewport_size: Vec2, pos: Vec2, plane: WorldPlane) -> Option<Vec3>;
 //   WorldPlane = 世界 Z=0 | 相机目标平面（无网格时 M5 坐标口径）
 pub fn orientation_gizmo(view_proj: &Mat4, rect: Rect) -> [(Vec2, bool); 3];
-//   view-proj 线性 3×3 列归一取 .xy + y 翻转；w≤0 端点取反规则（不复用 anchor_to_screen 的 None 语义）
+//   view-proj 线性 3×3 列归一取 .xy + y 翻转；列 xy 符号即朝向（不做 w≤0 取反——T3 实测钉住）；
+//   轴与视线精确平行时该轴不可见（不复用 anchor_to_screen 的 None 语义）
 ```
 
 ### 3.3 地面网格（core 生成 + line 管线接入）

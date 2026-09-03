@@ -48,3 +48,4 @@
 - T2 `3dca778`（spike 端到端实测：注入时序/空闲唤醒/locale 重建/Quit 均成立——详见 plan §5 回填；手动项：无闪烁目视、Cmd+Q 键等效、bundle 名）。
 - T4 `82d688e`（轴色常量 pub + 002 A4 语义锁测试：28 passed；pub 链路全可达，无需导出改动）。
 - T5 `2f6bb9b`（grid.rs 网格生成纯函数：LOD 分级/生成端裁剪/snap 对齐——A11 no-crawl 位级测试钉死；16 UT；`render/mod.rs` 注册随 `3dca778` 后协调提交，workspace 测试通过；`segment_capacity_bound` 供 T6 容量预建）。
+- T3 `6e58dcf`（相机数学三纯函数：screen_to_ray/pointer_world（GroundZ0+CameraTargetPlane）/orientation_gizmo_dirs；19 UT 全绿、core 174 passed、clippy 零警告。**偏差回填**：plan §3.2"w≤0 取反"改为"列 xy 符号即朝向、不取反"——实测推导取反会交换 Y/Z 臂，spec §6/plan 已同步修订并钉住测试）。
