@@ -43,16 +43,9 @@
 //! Actions are id-based and the scene never reuses ids, so an action for
 //! an object removed meanwhile is a safe no-op.
 //!
-//! Two entries exist side by side during the 004 integration (W4):
-//!
-//! - [`ui`] — the target entry: takes the app-owned [`ObjectsPanelState`]
-//!   and returns the [`ObjectsPanelOutput`] (tree actions + dialog-open
-//!   requests) for the caller (main.rs) to apply;
-//! - [`show_objects_panel`] — the pre-004 entry, kept as a shim so the
-//!   panel keeps working until main.rs wires the app-owned state into
-//!   [`ui`]. The shim stages its state in a process-local slot (see
-//!   [`legacy_ui_state`]) and applies the tree actions itself, under the
-//!   same short per-action scene locks the old rows used.
+//! One entry: [`ui`] takes the app-owned [`ObjectsPanelState`] and returns
+//! the [`ObjectsPanelOutput`] (tree actions + dialog-open requests) for the
+//! caller (main.rs) to apply under its scene lock.
 //!
 //! The add dialogs are unchanged from the flat-list era (they are removed
 //! by T17, A11, when the Add entries move into the toolbar): frame
@@ -76,6 +69,8 @@ use glam::Vec3;
 use roboview_core::displays::{DisplayKind, DisplayObject, Marker};
 use roboview_core::io::Color;
 use roboview_core::scene::Scene;
+
+#[cfg(test)]
 use roboview_core::scene::camera::OrbitCamera;
 
 use super::texts::{self, Locale};
@@ -141,22 +136,10 @@ pub struct ObjectsPanelOutput {
     pub open_add_marker: bool,
 }
 
-/// Panel requests to the caller (main.rs) of the pre-004 entry, consumed
-/// after the panel body ran: each `open_*` flag asks the caller to open
-/// the matching dialog with fresh scene-derived defaults.
-#[derive(Debug, Default)]
-pub struct PanelRequests {
-    /// The Add frame entry was clicked.
-    pub open_add_frame: bool,
-    /// The Add marker entry was clicked.
-    pub open_add_marker: bool,
-}
-
 /// Session state of the objects tree, owned by the caller across frames
-/// (main.rs once the 004 integration lands; [`show_objects_panel`] stages
-/// its instance until then). Public fields are the panel's contract with
-/// the rest of the app — the tree drives selection (004 spec §6: without
-/// picking, the selection comes from the tree alone), and the later tasks
+/// (main.rs). Public fields are the panel's contract with the rest of the
+/// app — the tree drives selection (004 spec §6: without picking, the
+/// selection comes from the tree alone), and the later tasks
 /// read/write the group colors when new members are created (T16 applies
 /// them at add time; D4: new members only).
 #[derive(Debug, Default)]
@@ -295,12 +278,6 @@ pub fn apply_actions(scene: &mut Scene<DisplayObject>, actions: &[TreeAction]) {
 /// [`egui::SidePanel`]) with the app-owned tree state. Returns the panel
 /// output for the caller to apply: the tree actions under its scene lock,
 /// plus the Fit/dialog requests it owns (see module docs).
-///
-/// Dead-code note (delete when wired): this is the T12/T11 handoff target
-/// — main.rs calls it once it owns an [`ObjectsPanelState`] field (and the
-/// pre-004 shim, [`show_objects_panel`], goes away). Until then the binary
-/// crate sees it as unreachable from `main`, hence the allow.
-#[allow(dead_code)]
 pub fn ui(
     ui: &mut egui::Ui,
     state: &mut ObjectsPanelState,
@@ -314,60 +291,6 @@ pub fn ui(
     let mut output = ObjectsPanelOutput::default();
     panel_body(ui, state, &rows, can_fit, locale, &mut output);
     output
-}
-
-/// Draw the objects sidebar with the pre-004 signature: a transitional
-/// shim around [`panel_body`] that stages its own state and applies the
-/// tree actions under short per-action scene locks, exactly like the
-/// flat-list rows it replaces. Kept until main.rs wires the app-owned
-/// [`ObjectsPanelState`] into [`ui`]; delete it together with
-/// [`legacy_ui_state`] then.
-pub fn show_objects_panel(
-    ui: &mut egui::Ui,
-    state: &Arc<Mutex<ViewportState>>,
-    locale: Locale,
-) -> PanelRequests {
-    let mut panel = legacy_ui_state();
-    let (rows, can_fit) = {
-        let viewport = viewport::lock_state(state);
-        (
-            rows_from_scene(&viewport.scene),
-            viewport.scene.bounds_union().is_some(),
-        )
-    };
-    let mut output = ObjectsPanelOutput::default();
-    panel_body(ui, &mut panel, &rows, can_fit, locale, &mut output);
-
-    if output.fit {
-        // Reframes to the union of the measurable objects; an empty union
-        // falls back to the default pose (core `framing(None)`).
-        let mut viewport = viewport::lock_state(state);
-        viewport.scene.camera = OrbitCamera::framing(viewport.scene.bounds_union().as_ref());
-    }
-    if !output.actions.is_empty() {
-        let mut viewport = viewport::lock_state(state);
-        apply_actions(&mut viewport.scene, &output.actions);
-    }
-    PanelRequests {
-        open_add_frame: output.open_add_frame,
-        open_add_marker: output.open_add_marker,
-    }
-}
-
-/// The panel state slot of [`show_objects_panel`]. Session state must live
-/// across frames for the tree to work (search, collapse, selection, group
-/// colors, the rename editor); the pre-004 entry has no app field to hold
-/// it, so it stages a single process-local instance — the app runs one
-/// objects panel on one UI thread. Once main.rs owns an
-/// [`ObjectsPanelState`] field and calls [`ui`], this shim (and the state
-/// slot) is removed.
-fn legacy_ui_state() -> std::sync::MutexGuard<'static, ObjectsPanelState> {
-    use std::sync::OnceLock;
-    static STATE: OnceLock<Mutex<ObjectsPanelState>> = OnceLock::new();
-    let state = STATE.get_or_init(|| Mutex::new(ObjectsPanelState::default()));
-    state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The shared panel chrome and tree body of both entries: heading, action

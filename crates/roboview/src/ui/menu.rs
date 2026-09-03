@@ -626,7 +626,7 @@ pub(crate) mod native {
         /// defaults of the 004 spec (§6: grid and origin axes default on).
         #[test]
         fn toggle_checks_start_enabled() {
-            assert!(INITIAL_TOGGLE_STATE);
+            const _: () = assert!(INITIAL_TOGGLE_STATE);
         }
     }
 }
@@ -637,9 +637,8 @@ pub(crate) mod native {
 // and the state mirrors.
 #[cfg(target_os = "macos")]
 // `action_from_id` stays unused until the main.rs wiring lands (it feeds
-// the drain dispatch — the single door of the dual path, a main.rs call
-// site outside this module's ownership). Remove the allow with that wiring.
-#[allow(unused_imports)]
+// the drain dispatch — the single door of the dual path (T10 wiring now
+// landed in main.rs).
 pub(crate) use native::{
     action_from_id, build_native, relabel, set_axes_checked, set_grid_checked, set_open_enabled,
 };

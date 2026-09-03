@@ -191,20 +191,6 @@ mod platform {
         at: Instant,
     }
 
-    /// Transitional entry serving the spike-era `main.rs` call site
-    /// (`RoboViewApp::new` — `ui::menu_bridge::init_bridge(&cc.egui_ctx)`,
-    /// a main.rs text this module cannot change until the T10 wiring
-    /// pass): forwards the real tree built at the default English locale to
-    /// [`init_bridge_with_menu`], so the app keeps compiling and running in
-    /// the interim. The wiring replaces this call site with
-    /// `init_bridge_with_menu(&ctx, ui::menu::build_native(locale))` using
-    /// the sys-locale value, then deletes this shim (T10 integration
-    /// recipe).
-    #[allow(dead_code)] // remove together with the main.rs call site it serves
-    pub(crate) fn init_bridge(ctx: &egui::Context) -> Option<BridgeCtx> {
-        init_bridge_with_menu(ctx, menu::build_native(Locale::En))
-    }
-
     /// Register the bridge: install the real menu tree built by
     /// `ui::menu::build_native(locale)` and register the process-wide event
     /// handler. Must run early in `App::new` (main thread, after winit

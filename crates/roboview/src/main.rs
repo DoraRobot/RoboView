@@ -50,8 +50,10 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use roboview_core::io::{self, LoadError, LoadedObject};
+use roboview_core::scene::camera::OrbitCamera;
 
-use ui::objects_panel::{self, AddFrameDialog, AddMarkerDialog};
+use ui::menu::AppAction;
+use ui::objects_panel::{self, AddFrameDialog, AddMarkerDialog, ObjectsPanelState};
 use ui::texts;
 use ui::theme;
 use ui::viewport::{self, ViewportState};
@@ -68,6 +70,7 @@ enum OpenKind {
 
 impl OpenKind {
     /// The File menu label of this family.
+    #[allow(dead_code)] // T20 toolbar Open▾ re-enables per-family labels
     fn menu_label(self, locale: texts::Locale) -> &'static str {
         match self {
             OpenKind::PointCloud => texts::menu_open_point_cloud(locale),
@@ -171,6 +174,9 @@ struct RoboViewApp {
     add_frame_dialog: AddFrameDialog,
     /// The Add marker dialog of the objects panel (spec §7 F4).
     add_marker_dialog: AddMarkerDialog,
+    /// Tree-side state of the objects panel (search filter, group
+    /// collapse/colors, selection label) — 004 app-owned subject (T12).
+    objects_state: ObjectsPanelState,
 }
 
 impl RoboViewApp {
@@ -180,8 +186,13 @@ impl RoboViewApp {
         // installed its default menu at `applicationDidFinishLaunching`, so
         // `init_for_nsapp` replaces it before the first frame. The app
         // struct keeps the bridge (and thus the menu tree) alive.
+        // The locale is resolved once, before the native menu tree is built:
+        // its labels are baked at install time and relabeled on switch
+        // (T10 integration recipe #1).
+        let locale = texts::Locale::from_tag(&sys_locale::get_locale().unwrap_or_default());
         #[cfg(target_os = "macos")]
-        let native_menu_bridge = ui::menu_bridge::init_bridge(&cc.egui_ctx);
+        let native_menu_bridge =
+            ui::menu_bridge::init_bridge_with_menu(&cc.egui_ctx, ui::menu::build_native(locale));
         // Dark theme by default: point colors read best on a dark canvas.
         // Theme switching is out of scope (spec §5 non-goals).
         cc.egui_ctx.set_theme(egui::Theme::Dark);
@@ -199,10 +210,11 @@ impl RoboViewApp {
             viewport: Arc::new(Mutex::new(ViewportState::new())),
             pending_object: None,
             load: None,
-            locale: texts::Locale::from_tag(&sys_locale::get_locale().unwrap_or_default()),
+            locale,
             error: None,
             add_frame_dialog: AddFrameDialog::new(),
             add_marker_dialog: AddMarkerDialog::new(),
+            objects_state: ObjectsPanelState::default(),
             #[cfg(target_os = "macos")]
             native_menu_bridge,
         }
@@ -212,6 +224,7 @@ impl RoboViewApp {
     /// background load of the chosen file. Blocking by design (rfd's
     /// modal dialog); the menu disables itself while a load is in flight,
     /// so at most one worker exists at a time.
+    #[allow(dead_code)] // T20 toolbar Open▾ re-enables per-family dialogs
     fn open_file_dialog(&mut self, ctx: &egui::Context, kind: OpenKind) {
         let (title, filter, extensions) = kind.dialog_spec(self.locale);
         let Some(path) = rfd::FileDialog::new()
@@ -226,6 +239,81 @@ impl RoboViewApp {
 
     /// Spawn the parse worker for `path`. On success the receiver replaces
     /// any finished slot; on spawn failure the user gets the error window.
+    /// The single "Open…" entry of the top menu: one native dialog listing
+    /// every file family with its own filter (004 T10). Per-family entries
+    /// live in the toolbar Open▾ (T20), which opens the family dialog
+    /// directly.
+    fn open_any_dialog(&mut self, ctx: &egui::Context) {
+        let (_, filter_pc, exts_pc) = OpenKind::PointCloud.dialog_spec(self.locale);
+        let (_, filter_mesh, exts_mesh) = OpenKind::Mesh.dialog_spec(self.locale);
+        let (_, filter_path, exts_path) = OpenKind::Path.dialog_spec(self.locale);
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(texts::tool_open(self.locale))
+            .add_filter(filter_pc, exts_pc)
+            .add_filter(filter_mesh, exts_mesh)
+            .add_filter(filter_path, exts_path)
+            .pick_file()
+        else {
+            return; // Cancelled: nothing to do.
+        };
+        // The dialog filtered by family, so the extension selects the kind
+        // for the load log; the loader itself dispatches by extension.
+        let kind = match path
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("ply" | "pcd") => OpenKind::PointCloud,
+            Some("obj") => OpenKind::Mesh,
+            Some("csv" | "xyz") => OpenKind::Path,
+            _ => OpenKind::PointCloud,
+        };
+        self.start_background_load(ctx, path, kind);
+    }
+
+    /// Dispatch one menu action of the dual path (004 T10): the macOS
+    /// native tree and the Win/Linux in-window bar both funnel here, so
+    /// every menu door behaves identically.
+    fn dispatch_action(&mut self, ctx: &egui::Context, action: AppAction) {
+        match action {
+            AppAction::Open => self.open_any_dialog(ctx),
+            AppAction::AddFrame => {
+                let (center, scale) = viewport::lock_state(&self.viewport).ui_defaults();
+                self.add_frame_dialog.open(center, scale);
+            }
+            AppAction::AddMarker => {
+                let (center, scale) = viewport::lock_state(&self.viewport).ui_defaults();
+                self.add_marker_dialog.open(center, scale);
+            }
+            AppAction::Language(locale) => {
+                self.locale = locale;
+                #[cfg(target_os = "macos")]
+                if let Some(bridge) = &self.native_menu_bridge {
+                    bridge.relabel(locale);
+                }
+            }
+            // Auxiliary toggles: the state lives in the viewport layer
+            // (T13 wires the HUD/toolbar double doors to the same subject).
+            AppAction::ToggleGrid | AppAction::ToggleAxes => {
+                tracing::info!(?action, "auxiliary toggle (wired with T13)");
+            }
+            // Toolbar-owned (Fit, T20), native-terminated (Quit never emits
+            // a MenuEvent), or without a door yet.
+            AppAction::Fit | AppAction::ResetView | AppAction::Quit => {
+                tracing::debug!(?action, "menu action without a handler yet");
+            }
+        }
+    }
+
+    /// Reflect the single-flight load state into the native menu's Open
+    /// item (the in-window bar filters at dispatch instead).
+    fn set_open_enabled(&mut self, enabled: bool) {
+        #[cfg(target_os = "macos")]
+        if let Some(bridge) = &self.native_menu_bridge {
+            bridge.set_open_enabled(enabled);
+        }
+    }
+
     fn start_background_load(&mut self, ctx: &egui::Context, path: PathBuf, kind: OpenKind) {
         tracing::info!(file = %path.display(), ?kind, "starting background load");
         let (sender, receiver) = mpsc::channel::<LoadOutcome>();
@@ -262,6 +350,7 @@ impl RoboViewApp {
             }) {
             Ok(_) => {
                 self.load = Some(receiver);
+                self.set_open_enabled(false);
             }
             Err(error) => {
                 tracing::warn!(%error, "could not start the background loader");
@@ -281,15 +370,18 @@ impl RoboViewApp {
         match receiver.try_recv() {
             Ok(LoadOutcome::Loaded { name, object }) => {
                 self.load = None;
+                self.set_open_enabled(true);
                 self.pending_object = Some(PendingObject { name, object });
             }
             Ok(LoadOutcome::Failed { file, error }) => {
                 self.load = None;
+                self.set_open_enabled(true);
                 self.error = Some(ErrorEvent::Failed { file, error });
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.load = None;
+                self.set_open_enabled(true);
                 self.error = Some(ErrorEvent::Aborted);
             }
         }
@@ -324,30 +416,24 @@ impl RoboViewApp {
 
     /// The top menu bar. The open entries are disabled while a background
     /// load runs (single-flight loading).
+    /// The window menu bar (Windows/Linux only — macOS renders the native
+    /// global bar per D5, and the top panel that hosts this method is gated
+    /// out on that platform). One door: the dual-path menu module, every
+    /// click funnels into [`Self::dispatch_action`].
+    #[cfg(not(target_os = "macos"))]
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let loading = self.load.is_some();
-        ui.menu_button(texts::menu_file(self.locale), |ui| {
-            for kind in [OpenKind::PointCloud, OpenKind::Mesh, OpenKind::Path] {
-                let open =
-                    ui.add_enabled(!loading, egui::Button::new(kind.menu_label(self.locale)));
-                if open.clicked() {
-                    ui.close();
-                    self.open_file_dialog(ui.ctx(), kind);
-                }
+        let mut actions = Vec::new();
+        ui::menu::egui_menu_bar(ui, self.locale, &mut actions);
+        for action in actions {
+            // Single-flight: the Open action is inert while a load runs (the
+            // native menu disables its item through the bridge; the
+            // in-window bar filters right here).
+            if matches!(action, AppAction::Open) && loading {
+                continue;
             }
-            // Language switcher (003 spec §6.2): self-named entries are
-            // stable identifiers; the menu is drawn before the panels of
-            // the same frame, so a direct switch is frame-consistent.
-            ui.separator();
-            ui.menu_button(texts::language_menu(self.locale), |ui| {
-                for locale in [texts::Locale::En, texts::Locale::ZhCn] {
-                    if ui.button(locale.name()).clicked() {
-                        self.locale = locale;
-                        ui.close();
-                    }
-                }
-            });
-        });
+            self.dispatch_action(ui.ctx(), action);
+        }
     }
 
     /// The left objects panel: Fit, Add frame/marker entries, and the
@@ -359,25 +445,39 @@ impl RoboViewApp {
         // at the 480×360 minimum window the panel stays ≥ 180 px wide while
         // the viewport keeps a sliver; egui clamps the panel to the space
         // that remains when the window is tighter.
-        // Task T12 (A6, objects_panel.rs) upgrades this panel's internals
-        // and extends this entry point with an app-owned ObjectsPanelState;
-        // main.rs wires the field into the call once the type lands there
-        // (exact signature per T12's report).
         let frame = region_frame(&ctx.style());
-        let requests = egui::SidePanel::left(egui::Id::new("objects_panel"))
+        let output = egui::SidePanel::left(egui::Id::new("objects_panel"))
             .resizable(true)
             .default_width(230.0)
             .width_range(180.0..=360.0)
             .frame(frame)
             .show(ctx, |ui| {
-                objects_panel::show_objects_panel(ui, &state, self.locale)
+                let lock = viewport::lock_state(&state);
+                objects_panel::ui(ui, &mut self.objects_state, &lock.scene, self.locale)
             })
             .inner;
-        if requests.open_add_frame {
+        // Scene mutations the panel queued (rename/visibility/delete): the
+        // GPU handles live in the objects' Drop path, so the A6 resource
+        // ledger stays balanced; a stale id is a no-op in the scene API.
+        if !output.actions.is_empty() {
+            objects_panel::apply_actions(
+                &mut viewport::lock_state(&self.viewport).scene,
+                &output.actions,
+            );
+        }
+        if output.fit {
+            viewport::lock_state(&self.viewport).scene.camera = OrbitCamera::framing(
+                viewport::lock_state(&self.viewport)
+                    .scene
+                    .bounds_union()
+                    .as_ref(),
+            );
+        }
+        if output.open_add_frame {
             let (center, scale) = viewport::lock_state(&self.viewport).ui_defaults();
             self.add_frame_dialog.open(center, scale);
         }
-        if requests.open_add_marker {
+        if output.open_add_marker {
             let (center, scale) = viewport::lock_state(&self.viewport).ui_defaults();
             self.add_marker_dialog.open(center, scale);
         }
@@ -457,13 +557,16 @@ impl RoboViewApp {
 
 impl eframe::App for RoboViewApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // Native macOS menu events (004 spike T2): drain the bridge queue
-        // once per frame. This spike only logs — dispatch to real actions
-        // (AppAction) lands in T10.
+        // Native macOS menu events (004 T10): drain the bridge queue once
+        // per frame and map ids through the single action table — the same
+        // dispatch the in-window bar uses.
         #[cfg(target_os = "macos")]
         if let Some(bridge) = &mut self.native_menu_bridge {
             for event in bridge.drain() {
-                tracing::info!(menu_id = %event.id().0, "native menu event (004 spike)");
+                match ui::menu::action_from_id(event.id()) {
+                    Some(action) => self.dispatch_action(ctx, action),
+                    None => tracing::warn!(menu_id = %event.id().0, "menu event without an action"),
+                }
             }
         }
 
@@ -486,6 +589,9 @@ impl eframe::App for RoboViewApp {
         // the full-width bottom status-band placeholder (T15), the left
         // objects panel, the right properties placeholder (T14), and the
         // central viewport last — it fills whatever the regions leave.
+        // The in-window menu bar exists only where there is no native bar
+        // (D5): macOS hosts the menu in the system menu bar instead.
+        #[cfg(not(target_os = "macos"))]
         egui::TopBottomPanel::top(egui::Id::new("menu_bar")).show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 self.menu_bar(ui);

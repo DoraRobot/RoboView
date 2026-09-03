@@ -316,7 +316,6 @@ impl TextKey {
     /// code never iterates the key space.
     #[cfg(test)]
     pub const ALL: &'static [TextKey] = &[
-        TextKey::MenuFile,
         TextKey::MenuOpenPointCloud,
         TextKey::MenuOpenMesh,
         TextKey::MenuOpenPath,
@@ -366,6 +365,7 @@ impl TextKey {
         TextKey::PathTooFewPoints,
         TextKey::PathLimit,
         TextKey::ReadError,
+        TextKey::MenuFile,
         TextKey::ToolOpen,
         TextKey::ToolAdd,
         TextKey::ToggleGrid,
@@ -398,7 +398,6 @@ impl TextKey {
 /// the key space so a new key can never go missing silently.
 static EN: &[(TextKey, &str)] = &[
     // File menu and native dialog specs.
-    (TextKey::MenuFile, "File"),
     (TextKey::MenuOpenPointCloud, "Open point cloud…"),
     (TextKey::MenuOpenMesh, "Open mesh (OBJ)…"),
     (TextKey::MenuOpenPath, "Open path (CSV/XYZ)…"),
@@ -497,6 +496,7 @@ static EN: &[(TextKey, &str)] = &[
     ),
     (TextKey::ReadError, "Could not read the file: {error}"),
     // 004 ui-blueprint copy — toolbar & helper layers (004 spec §6).
+    (TextKey::MenuFile, "File"),
     (TextKey::ToolOpen, "Open…"),
     (TextKey::ToolAdd, "Add…"),
     (TextKey::ToggleGrid, "Grid"),
@@ -542,7 +542,6 @@ static EN: &[(TextKey, &str)] = &[
 /// one-time warning instead of a crash (spec M4).
 static ZH: &[(TextKey, &str)] = &[
     // File menu and native dialog specs.
-    (TextKey::MenuFile, "文件"),
     (TextKey::MenuOpenPointCloud, "打开点云…"),
     (TextKey::MenuOpenMesh, "打开网格（OBJ）…"),
     (TextKey::MenuOpenPath, "打开路径（CSV/XYZ）…"),
@@ -620,6 +619,7 @@ static ZH: &[(TextKey, &str)] = &[
     (TextKey::PathLimit, "路径文件超出支持的加载上限：{reason}"),
     (TextKey::ReadError, "无法读取文件：{error}"),
     // 004 ui-blueprint copy — toolbar & helper layers (004 spec §6).
+    (TextKey::MenuFile, "文件"),
     (TextKey::ToolOpen, "打开…"),
     (TextKey::ToolAdd, "添加…"),
     (TextKey::ToggleGrid, "网格"),
@@ -756,11 +756,6 @@ fn interpolate(template: &str, args: &[(&str, &str)]) -> String {
     }
     out.push_str(rest);
     out
-}
-
-/// Label of the top menu bar's first menu.
-pub fn menu_file(locale: Locale) -> &'static str {
-    resolve(locale, TextKey::MenuFile)
 }
 
 /// File menu item opening the point cloud picker (PLY/PCD).
@@ -1287,8 +1282,6 @@ mod tests {
 
     #[test]
     fn lookup_finds_rows_and_reports_none_on_empty_table() {
-        assert_eq!(lookup(EN, TextKey::MenuFile), Some("File"));
-        assert_eq!(lookup(ZH, TextKey::MenuFile), Some("文件"));
         assert_eq!(lookup(&[], TextKey::MenuFile), None);
     }
 
