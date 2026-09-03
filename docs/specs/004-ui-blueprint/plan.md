@@ -1,12 +1,12 @@
 # ui-blueprint — 方案
 
-状态：Draft（草案）
+状态：Approved（已批准）
 
 日期：2026-09-03
 
-相关：`spec.md`（In Review）；ADR 004、ADR 006；`docs/specs/001-point-cloud-viewport/`（A11 固定测量协议）、`docs/specs/002-display-types/`（A6 台账/语义色）、`docs/specs/003-i18n-system-fonts/`（texts.rs/字体链/错误机制）；`docs/plans/2026-09-03-ui-feature-roadmap.md`
+相关：`spec.md`（Approved）；ADR 004、ADR 006；`docs/specs/001-point-cloud-viewport/`（A11 固定测量协议）、`docs/specs/002-display-types/`（A6 台账/语义色）、`docs/specs/003-i18n-system-fonts/`（texts.rs/字体链/错误机制）；`docs/plans/2026-09-03-ui-feature-roadmap.md`
 
-修订记录：2026-09-03 起草（按 spec 重审落位后的全套约束；待负责人评审 → Approved）。
+修订记录：2026-09-03 起草（按 spec 重审落位后的全套约束）；同日经负责人评审通过（Draft → Approved）。
 
 ## 1. 概述
 
