@@ -68,6 +68,12 @@ Add frame/marker 是浮动非模态窗口（与"树+属性即编辑"的成熟工
   互斥模式感按钮组）；左=对象树（`objects_panel` 升级：分组/折叠/眼睛/右键/搜索）；中=视口
   （保留，追加 HUD 悬浮层：网格/轴开关——悬浮层为**视口角标**而非菜单）；右=属性面板（新
   `properties_panel.rs`，分组卡片 + DragValue 控件）；底=状态栏（新 `status_bar.rs`）。
+- **主菜单栏策略（D5，已确认）**：macOS = 原生全局菜单栏（`muda` 注入 NSApplication.mainMenu，隐藏
+  窗口内菜单——符合系统习惯）；Windows/Linux = 窗口内 egui 菜单栏（Linux 用 GTK 原生菜单与自研
+  egui 核心冲突，Windows 挖原生 HWND 不值）。双路径均映射到同一 `AppAction` 枚举
+  （`ui/menu.rs`：原生 item id / 窗口内按钮 id → 同一 handler）；locale 切换经 muda `set_text`
+  重建菜单标签。muda 0.19.3 已核验：Apache-2.0 OR MIT、MSRV 1.73、winit 仅 dev-dep
+  （`init_for_nsapp()` 无参注入 + `MenuEvent::receiver()` 每帧轮询）；准入前做接线 spike。
 - **语义色板**（`ui/theme.rs` 统一定义 token）：选中高亮（橙系）、网格线、原点轴（RGB 沿用）、
   HUD 文字、面板背景（沿用暗色系）；视口底中性灰。
 - 选中态：树行/视口/属性三区同一选中对象（id 语义，`Scene` 已有）；无拾取时选中仅来源于树。
@@ -76,6 +82,8 @@ Add frame/marker 是浮动非模态窗口（与"树+属性即编辑"的成熟工
   主流程交互（错误消息窗口沿用 003 机制不变，直至 007 迁移）。
 
 ## 7. 决策点（待人工确认；批准时落位正文并删除本节点）
+
+> D5（主菜单栏策略）已于 2026-09-03 确认：macOS 原生 muda 菜单栏 + 窗口内兜底（Win/Linux）；已落位 §6。
 
 - D1 选中来源先树后拾取（推荐：本功能树上选中驱动属性；005 再打通视口射线）——确认？
 - D2 底部范围：状态栏（帧率/坐标/提示）+ 轻量消息条（错误/警告时间戳内联，错误窗保留并存）——
