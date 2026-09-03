@@ -83,7 +83,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use eframe::egui;
 use egui_wgpu::wgpu;
-use glam::{Mat4, Vec2, Vec3, Vec4};
+use glam::{Mat4, Vec2, Vec3, Vec4, vec2};
 
 use roboview_core::displays::{self, DisplayObject, Marker};
 use roboview_core::io;
@@ -193,6 +193,10 @@ pub struct ViewportState {
     /// nothing regenerates while the camera sits still (A11: no crawl, no
     /// per-frame rework).
     grid_refresh_key: Option<Mat4>,
+    /// Pointer position inside the viewport of the frame currently being
+    /// built (status-bar world coordinate). `show_viewport` records it
+    /// once per frame; empty when the pointer is outside.
+    pointer_hover: Option<Vec2>,
     /// Viewport rect of the frame currently being built, in points.
     /// `show_viewport` records it while drawing; the paint callback of the
     /// same frame reads it as the aspect-ratio source. Rect proportions
@@ -220,6 +224,7 @@ impl ViewportState {
             grid_mesh: None,
             axes_meshes: None,
             grid_refresh_key: None,
+            pointer_hover: None,
             viewport_rect: egui::Rect::NOTHING,
             frame_serial: 0,
             marker_serial: 0,
@@ -399,6 +404,31 @@ impl ViewportState {
     /// [`ViewportState::toggle_grid`].
     pub fn toggle_axes(&mut self) {
         self.axes_on = !self.axes_on;
+    }
+
+    /// Pointer → world intersection of the frame being built (status bar
+    /// world coordinate, spec M5). Plane: the Z=0 ground grid while the
+    /// grid is on, the camera-target plane otherwise — the same
+    /// reference-plane rule `pointer_world` documents.
+    pub fn pointer_world(&self) -> Option<Vec3> {
+        let pos = self.pointer_hover?;
+        let rect = self.viewport_rect;
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return None;
+        }
+        let aspect = rect.width() / rect.height();
+        let view_proj = self.scene.camera.view_proj(aspect);
+        let plane = if self.grid_on {
+            roboview_core::render::camera_math::WorldPlane::GroundZ0
+        } else {
+            roboview_core::render::camera_math::WorldPlane::CameraTargetPlane
+        };
+        roboview_core::render::camera_math::pointer_world(
+            &view_proj,
+            vec2(rect.width(), rect.height()),
+            pos,
+            plane,
+        )
     }
 
     /// Refresh the helper layer for the frame being prepared: provision
@@ -854,6 +884,10 @@ pub fn show_viewport(
         // The paint callback and the overlay pass of this frame read this
         // rect (aspect, label placement).
         viewport.viewport_rect = rect;
+        viewport.pointer_hover = ui
+            .ctx()
+            .input(|i| i.pointer.hover_pos())
+            .map(|p| Vec2::new(p.x, p.y));
         let scene_empty = viewport.scene.is_empty();
         // Camera input and the paint callback are gated on "content or
         // helper layer" (spec §6, A11): with the grid or the axes on, an
@@ -893,6 +927,11 @@ pub fn show_viewport(
         paint_labels(&painter, rect, state);
         paint_indicator(&painter, rect, state);
     }
+
+    // Corner HUD switches of the helper layer (spec §6: the toolbar
+    // buttons and these corner toggles are two doors onto the same state —
+    // both read the ViewportState accessors and flip through toggles).
+    paint_aux_switches(ui, rect, state, locale);
 
     if scene_empty {
         // Placeholder text above whatever the helper layer draws (spec
@@ -942,6 +981,46 @@ pub fn show_viewport(
 /// ([`render::anchor_to_screen`], spec §7 F3/F4). Anchors that project
 /// outside the frustum are culled by the pure function, so labels appear
 /// and disappear cleanly at the viewport edges.
+/// Corner HUD switches of the helper layer (spec §6: the toolbar buttons
+/// and these top-left corner toggles are two doors onto the same state —
+/// both read the [`ViewportState`] accessors and flip through the
+/// toggles). Drawn after the 3D callback like the other overlays, so the
+/// switches always sit on top of the viewport.
+fn paint_aux_switches(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    state: &Arc<Mutex<ViewportState>>,
+    locale: Locale,
+) {
+    if !rect.width().is_finite() || rect.height() <= 0.0 {
+        return;
+    }
+    let grid_on = lock_state(state).grid_on();
+    let axes_on = lock_state(state).axes_on();
+    egui::Area::new(egui::Id::new("viewport_aux_switches"))
+        .fixed_pos(rect.left_top() + egui::vec2(8.0, 8.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(grid_on, texts::toggle_grid(locale))
+                        .on_hover_text(texts::grid_toggle_tooltip(locale))
+                        .clicked()
+                    {
+                        lock_state(state).toggle_grid();
+                    }
+                    if ui
+                        .selectable_label(axes_on, texts::toggle_axes(locale))
+                        .on_hover_text(texts::axes_toggle_tooltip(locale))
+                        .clicked()
+                    {
+                        lock_state(state).toggle_axes();
+                    }
+                });
+            });
+        });
+}
+
 fn paint_labels(painter: &egui::Painter, rect: egui::Rect, state: &Arc<Mutex<ViewportState>>) {
     let viewport = lock_state(state);
     let view_proj = viewport.scene.camera.view_proj(viewport.aspect());

@@ -726,18 +726,19 @@ impl RoboViewApp {
     /// load-state / tool / pointer-coordinate / FPS readouts (spec A7) and
     /// the lightweight message strip (D2). The strip is fed from the
     /// session log [`Self::record_message`] fills on every load failure.
-    /// The pointer-world readout is the last wiring point: it needs the
-    /// viewport-layer intersection of the T13 grid/axes wiring, so until
-    /// T13 reports it the segment shows its dimmed placeholders.
     fn status_bar_panel(&mut self, ctx: &egui::Context) {
-        let frame = region_frame(&ctx.style());
+        // The 26 px band trims the shared 8 px panel margin vertically so
+        // the single text row stays unclipped (status_bar module doc).
+        let frame = egui::Frame::side_top_panel(&ctx.style())
+            .fill(theme::PANEL_BACKGROUND)
+            .inner_margin(egui::Margin::symmetric(8.0, 2.0));
+        // Pointer-world intersection from the viewport layer: the frame's
+        // stored rect and pointer, reference plane Z=0 while the grid is
+        // shown and the camera-target plane while hidden.
+        let pointer_world = viewport::lock_state(&self.viewport).pointer_world();
         let info = StatusInfo {
             loading: self.load.is_some(),
-            // T13 wiring point: the pointer-world intersection computed by
-            // the viewport layer from its per-frame rect (reference plane:
-            // Z=0 while the grid is shown, the camera-target plane while
-            // hidden — `roboview_core::render::camera_math::pointer_world`).
-            pointer_world: None,
+            pointer_world,
             tool: TOOL_NAVIGATE,
             messages: &self.messages,
         };

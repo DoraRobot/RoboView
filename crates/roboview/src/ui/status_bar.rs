@@ -10,28 +10,32 @@
 //! [strip?][Loading…|Ready][Navigate]…… x=1.23 y=4.56 z=7.89 …… FPS: 60.2
 //! ```
 //!
-//! - the **message strip** appears only while the app holds at least one
-//!   error/warning ([`MessageItem`]); it shows the most recent
-//!   [`MAX_VISIBLE_MESSAGES`] entries, newest first, each as a colored dot
-//!   + `HH:MM:SS` clock + the message text elided to the strip's share of
-//!   the row. Newlines are flattened so one message never grows a second
-//!   line (the error templates of texts.rs are multi-line copy).
-//! - the **load-state segment** resolves [`texts::ViewportLoading`] /
-//!   [`texts::StatusReady`] in the current locale;
-//! - the **tool segment** shows the current interaction-mode hint. 004
-//!   introduces no tool state and the texts.rs key space is closed, so the
-//!   default mode is the module constant [`TOOL_NAVIGATE`] — an
-//!   untranslated mode token (like the axis letters), not user copy; an
-//!   empty string hides the segment;
-//! - the **coordinate segment** is centered on the remaining row width and
-//!   prints the pointer's world intersection `x=… y=… z=…` ({:.2}, the
-//!   scene's meter unit); while the pointer is outside the viewport or the
-//!   ray misses the reference plane ([`pointer_world`] semantics: Z=0
-//!   ground plane, or the camera-target plane when the grid is hidden) it
-//!   shows dimmed `x=– y=– z=–` placeholders so the segment stays
-//!   resident;
-//! - the **FPS segment** is flush right: `{fps-label}: {value:.1}` with a
-//!   `–` placeholder before the first recorded frame.
+//! The **message strip** appears only while the app holds at least one
+//! error/warning ([`MessageItem`]); it shows the most recent
+//! [`MAX_VISIBLE_MESSAGES`] entries, newest first, each a colored dot with an
+//! `HH:MM:SS` clock, the message text elided to the strip's share of the row.
+//! Newlines are flattened so one message never grows a second line
+//! (the error templates of texts.rs are multi-line copy);
+//!
+//! The segments, from left to right:
+//!
+//! **Load state** — resolves [`texts::ViewportLoading`] / [`texts::StatusReady`]
+//! in the current locale;
+//!
+//! **Tool** — the current interaction-mode hint. 004 introduces no tool state
+//! and the texts.rs key space is closed, so the default mode is the module
+//! constant [`TOOL_NAVIGATE`] — an untranslated mode token (like the axis
+//! letters), not user copy; an empty string hides the segment;
+//!
+//! **Coordinate** — centered on the remaining row width, prints the pointer's
+//! world intersection `x=… y=… z=…` ({:.2}, the scene's meter unit); while the
+//! pointer is outside the viewport or the ray misses the reference plane
+//! ([`pointer_world`] semantics: Z=0 ground plane, or the camera-target plane
+//! when the grid is hidden) it shows dimmed `x=– y=– z=–` placeholders so the
+//! segment stays resident;
+//!
+//! **FPS** — flush right: `{fps-label}: {value:.1}` with a `–` placeholder
+//! before the first recorded frame.
 //!
 //! Copy discipline: every user-facing word above flows through the keyed
 //! tables of `texts.rs` — the readout labels resolve per frame in the
@@ -378,12 +382,12 @@ pub fn clock_text(time: SystemTime) -> String {
 /// stable: two messages with the same instant keep their log order (older
 /// arrival first in the slice stays first between equals). Pure —
 /// unit-tested with fixed instants.
-pub fn recent_messages<'a>(log: &'a [MessageItem], max: usize) -> Vec<&'a MessageItem> {
+pub fn recent_messages(log: &[MessageItem], max: usize) -> Vec<&MessageItem> {
     if max == 0 {
         return Vec::new();
     }
     let mut newest_first: Vec<&MessageItem> = log.iter().collect();
-    newest_first.sort_by(|a, b| b.time.cmp(&a.time));
+    newest_first.sort_by_key(|m| std::cmp::Reverse(m.time));
     newest_first.truncate(max);
     newest_first
 }
