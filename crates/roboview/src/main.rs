@@ -933,6 +933,14 @@ impl eframe::App for RoboViewApp {
             let id = self.demo_ids[idx];
             viewport::lock_state(&self.viewport).set_selected(Some(id));
         }
+        // A12 run keep-alive: an idle winit loop never repaints, so the
+        // measuring run re-arms itself for the *next* frame while the demo
+        // scene is active — uncapped, so the recorded frame times are the
+        // true interactive cost (the manual protocol needs continuous
+        // samples).
+        if self.demo_install.is_some() || !self.demo_ids.is_empty() {
+            ctx.request_repaint();
+        }
         self.top_region(ctx);
         self.status_bar_panel(ctx);
         self.objects_panel(ctx);
