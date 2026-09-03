@@ -131,7 +131,12 @@ pub enum AppAction { Open, Fit, AddFrame, AddMarker, ToggleGrid, ToggleAxes, Lan
 - **A6 台账**：C5 的 per-object uniform 与几何句柄同生共死，不新增 counters 行——实现时以 002 A6 判据回归验证（50 轮循环）。
 - **路径守卫**：无 `.ply/.pcd/.obj/.csv/.xyz` 字面量进入源码；网格/指示器为纯代码生成。
 - **macOS 平台**：muda 相关代码 cfg 门控；ubuntu 侧编译面不得出现 muda 踪迹（门控为编译必需）。
-- **muda spike 结论**：W0 结果（时序/唤醒/重建）写回 A4 与 plan 修订记录——若与 spec 声明冲突以实测为准并修订 spec。
+- **muda spike 结论（T2 实测回填）**：① `MenuId` 为 `pub String`（非 u32），事件映射按字符串设计；
+  ② muda `Menu`/`Submenu` 为 `Rc` 非 Send——**菜单树必须由 app 持有保活**（BridgeCtx 字段模式），
+  static 仅放事件队列（`VecDeque<MenuEvent>`）；③ handler 内**即时 `request_repaint()`** 端到端可靠
+  （osascript 实点验证），`request_repaint_after` 预排程不可靠（一次性丢、尾部量化）；④ 注入时序/
+  items 层 set_text/OnceCell 单次注册/Quit 均落实测；手动项=无闪烁目视、Cmd+Q、bundle 名，记入 004 MAN。
+  若与 spec 声明冲突以实测为准并修订 spec（本次无：spec 声明全部成立）。
 
 ## 6. 测试与验证
 
