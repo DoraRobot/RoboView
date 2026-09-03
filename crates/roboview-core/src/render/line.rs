@@ -31,15 +31,22 @@
 //! draw), and every strip that reaches the GPU has at least two finite
 //! vertices.
 //!
-//! # Persistent line meshes (004 ui-blueprint)
+//! # Persistent line meshes and the appearance channel (004 ui-blueprint)
 //!
-//! Besides the upload forms above, the pipeline provisions the 004 viewport
-//! helper form ([`LinePipeline::with_capacity`],
-//! [`LinePipeline::update_mesh`]): vertex buffers preallocated once and
-//! refreshed in place by queue writes — the ground-grid refresh path
-//! (plan §3.3) that must never provision GPU objects per frame. Helper
-//! layers are not scene objects: their mesh is owned by the viewport and
-//! records no A6 ledger rows (spec §6: 不入场景树、不参与台账).
+//! Besides the upload forms above, the pipeline provisions two 004 viewport
+//! capabilities:
+//!
+//! - **Persistent meshes** ([`LinePipeline::with_capacity`],
+//!   [`LinePipeline::update_mesh`]): vertex buffers preallocated once and
+//!   refreshed in place by queue writes — the ground-grid refresh path
+//!   (plan §3.3) that must never provision GPU objects per frame. Helper
+//!   layers are not scene objects: their mesh is owned by the viewport and
+//!   records no A6 ledger rows (spec §6: 不入场景树、不参与台账).
+//! - **Appearance channel** ([`Appearance`], plan §3.1): every line mesh
+//!   carries one fixed 64-byte uniform buffer plus bind group at
+//!   group(1)/binding(0), provisioned and dropped together with the
+//!   geometry handle; the shader mixes it over the per-vertex colors
+//!   (color-override and selection-highlight flag bits).
 //!
 //! # Shared depth policy (spec §6, plan §3.3)
 //!
@@ -60,7 +67,8 @@ use glam::Vec3;
 
 use super::counters;
 use super::renderer::{
-    COLOR_ATTRIBUTES, COLOR_STRIDE_BYTES, POSITION_ATTRIBUTES, POSITION_STRIDE_BYTES, Renderer,
+    Appearance, AppearanceGpu, COLOR_ATTRIBUTES, COLOR_STRIDE_BYTES, POSITION_ATTRIBUTES,
+    POSITION_STRIDE_BYTES, Renderer, create_appearance_gpu, write_appearance,
 };
 use crate::displays::DisplayKind;
 use crate::io;
@@ -249,13 +257,16 @@ fn pack_strips(strips: &[CpuStrip]) -> (Vec<u8>, Vec<u8>, Vec<(u32, u32)>) {
     (position_bytes, color_bytes, ranges)
 }
 
-/// GPU handles of one line geometry: the positions and per-vertex color
-/// buffers plus the bind group referencing the renderer's scene-wide
-/// view-projection uniform buffer. Owned by the caller (a path, frame, or
+/// GPU handles of one uploaded line geometry: the positions and per-vertex
+/// color buffers, the bind group referencing the renderer's scene-wide
+/// view-projection uniform buffer, and the per-object appearance channel
+/// ([`AppearanceGpu`], group 1). Owned by the caller — a path, frame, or
 /// marker-arrow display behind an [`Arc`], or the viewport itself for the
-/// persistent helper form of [`LinePipeline::with_capacity`]); dropping it
+/// persistent helper form of [`LinePipeline::with_capacity`]; dropping it
 /// frees the buffers through wgpu's deferred destruction, exactly like
-/// [`crate::render::renderer::PointCloudMesh`] (`renderer` module).
+/// [`crate::render::renderer::PointCloudMesh`] (`renderer` module). The
+/// appearance resources ride inside this struct, provisioned and dropped
+/// together with the geometry (plan §3.1).
 pub struct LineMesh {
     positions: wgpu::Buffer,
     colors: wgpu::Buffer,
@@ -264,6 +275,7 @@ pub struct LineMesh {
     /// empty (e.g. an all-non-finite path) — paint then draws nothing.
     strips: Vec<(u32, u32)>,
     bind_group: wgpu::BindGroup,
+    appearance: AppearanceGpu,
     /// Vertex capacity the `positions`/`colors` buffers were sized for: the
     /// vertex count of the upload, or the `with_capacity` preallocation for
     /// the persistent form. [`LinePipeline::update_mesh`] refuses refreshes
@@ -285,17 +297,19 @@ pub struct LinePipeline {
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    appearance_bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
 }
 
 impl LinePipeline {
     /// Create the line pipeline against a [`Renderer`], reading every
     /// shared-depth parameter (depth format, sample count), the target
-    /// format, and the scene's shared bind group layout and uniform buffer
-    /// from it — the renderer is the single source for the whole scene
-    /// (plan §3.3), so this pipeline can never disagree with the pass the
-    /// host opens. Rebuild it whenever the renderer is rebuilt (target
-    /// format, depth format, or sample count change).
+    /// format, and the scene's shared bind group layouts (scene + per-
+    /// object appearance) and uniform buffer from it — the renderer is the
+    /// single source for the whole scene (plan §3.3), so this pipeline can
+    /// never disagree with the pass the host opens. Rebuild it whenever the
+    /// renderer is rebuilt (target format, depth format, or sample count
+    /// change).
     pub fn new(renderer: &Renderer) -> Self {
         let device = renderer.device();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -304,9 +318,12 @@ impl LinePipeline {
         });
 
         let bind_group_layout = renderer.scene_bind_group_layout();
+        let appearance_bind_group_layout = renderer.appearance_bind_group_layout();
+        // Two bind groups per pipeline: group 0 the scene-wide view-proj
+        // uniform, group 1 the per-object appearance uniform (spec §6).
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("line"),
-            bind_group_layouts: &[bind_group_layout],
+            bind_group_layouts: &[bind_group_layout, appearance_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -357,6 +374,7 @@ impl LinePipeline {
             queue: renderer.queue().clone(),
             pipeline,
             bind_group_layout: renderer.scene_bind_group_layout().clone(),
+            appearance_bind_group_layout: renderer.appearance_bind_group_layout().clone(),
             uniform_buffer: renderer.uniform_buffer().clone(),
         }
     }
@@ -416,11 +434,22 @@ impl LinePipeline {
             }],
         });
 
+        // The per-object appearance channel rides in the same handle
+        // (plan §3.1); it starts neutral so the baked vertex colors show.
+        let appearance = create_appearance_gpu(
+            &self.device,
+            &self.queue,
+            &self.appearance_bind_group_layout,
+            "line.appearance",
+            &Appearance::DEFAULT,
+        );
+
         Arc::new(LineMesh {
             positions,
             colors,
             strips: ranges,
             bind_group,
+            appearance,
             vertex_capacity: total_vertices,
             staging_positions: Vec::new(),
             staging_colors: Vec::new(),
@@ -429,11 +458,14 @@ impl LinePipeline {
 
     /// Record the draws of one line mesh into an externally opened render
     /// pass (mirrors [`Renderer::paint`]: records commands only, never
-    /// creates or submits a pass or encoder). Issues one `LineStrip` draw
-    /// per strip range; a mesh whose CPU geometry was empty draws nothing.
+    /// creates or submits a pass or encoder). Sets the pipeline, the mesh's
+    /// bind groups (group 0: view-proj; group 1: the appearance uniform),
+    /// and issues one `LineStrip` draw per strip range; a mesh whose CPU
+    /// geometry was empty draws nothing.
     pub fn paint(&self, pass: &mut wgpu::RenderPass<'static>, mesh: &LineMesh) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &mesh.bind_group, &[]);
+        pass.set_bind_group(1, &mesh.appearance.bind_group, &[]);
         pass.set_vertex_buffer(0, mesh.positions.slice(..));
         pass.set_vertex_buffer(1, mesh.colors.slice(..));
         for &(start, count) in &mesh.strips {
@@ -444,11 +476,11 @@ impl LinePipeline {
     /// Create a persistent [`LineMesh`] whose vertex buffers are
     /// preallocated for `segments` two-vertex strips (2·segments vertices)
     /// — the viewport-helper form (ground grid, spec §6/plan §3.3). The
-    /// buffers, bind groups, and the CPU staging are all created once here
-    /// and refreshed in place by [`LinePipeline::update_mesh`], which never
-    /// provisions GPU objects — a per-frame refresh therefore never touches
-    /// the A6 ledger (helper layers are not scene objects, spec §6) and
-    /// never rebuilds anything.
+    /// buffers, bind groups, appearance uniform, and the CPU staging are
+    /// all created once here and refreshed in place by
+    /// [`LinePipeline::update_mesh`], which never provisions GPU objects —
+    /// a per-frame refresh therefore never touches the A6 ledger (helper
+    /// layers are not scene objects, spec §6) and never rebuilds anything.
     ///
     /// `segments` must cover the largest refresh the caller will issue; the
     /// grid module's [`super::grid::segment_capacity_bound`] exists for
@@ -488,12 +520,20 @@ impl LinePipeline {
                 resource: self.uniform_buffer.as_entire_binding(),
             }],
         });
+        let appearance = create_appearance_gpu(
+            &self.device,
+            &self.queue,
+            &self.appearance_bind_group_layout,
+            "line.persistent.appearance",
+            &Appearance::DEFAULT,
+        );
 
         LineMesh {
             positions,
             colors,
             strips: Vec::with_capacity(segments),
             bind_group,
+            appearance,
             vertex_capacity: vertices,
             staging_positions: Vec::with_capacity(vertex_capacity * POSITION_STRIDE_BYTES as usize),
             staging_colors: Vec::with_capacity(vertex_capacity * COLOR_STRIDE_BYTES as usize),
@@ -534,6 +574,14 @@ impl LinePipeline {
             .write_buffer(&mesh.positions, 0, &mesh.staging_positions);
         self.queue
             .write_buffer(&mesh.colors, 0, &mesh.staging_colors);
+    }
+
+    /// Refresh the appearance of one line mesh in place (plan §3.1): one
+    /// 64-byte queue write into the mesh's preallocated appearance uniform.
+    /// Never creates a buffer or bind group and never triggers a renderer
+    /// or scene rebuild; the effect is visible on the next frame.
+    pub fn set_appearance(&self, mesh: &LineMesh, appearance: &Appearance) {
+        write_appearance(&self.queue, &mesh.appearance, appearance);
     }
 }
 

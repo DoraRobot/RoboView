@@ -40,6 +40,129 @@ pub(crate) const COLOR_STRIDE_BYTES: u64 = 4;
 /// one `mat4x4<f32>`.
 const UNIFORM_SIZE_BYTES: u64 = 64;
 
+/// Byte size of one object's appearance uniform. Fixed at 64 bytes
+/// (ui-blueprint spec §6, plan §3.1): albedo 16 + flags 4 + 12 implicit
+/// padding + 32 reserved bytes. Every uploaded object provisions one such
+/// buffer at group(1) binding(0); the WGSL `ObjectAppearance` struct of the
+/// three shaders and the CPU packer are pinned to this layout by tests.
+pub const APPEARANCE_SIZE_BYTES: u64 = 64;
+
+/// Appearance flag bit 0: replace the baked per-vertex colors with
+/// [`Appearance::albedo`]. Points and lines carry per-vertex colors, so
+/// this bit is their override switch; mesh faces have no per-vertex color
+/// and always take their color from the uniform, so the mesh shader does
+/// not read this bit. WGSL mirror: `APPEARANCE_FLAG_OVERRIDE` in all three
+/// shaders (pinned by a unit test).
+pub const APPEARANCE_FLAG_OVERRIDE: u32 = 1 << 0;
+
+/// Appearance flag bit 1: selection highlight — the drawn color is
+/// multiplied by 1.25 in linear light and clamped. ui-blueprint spec §6:
+/// the selection marker of 004 rides this bit, and 005 picking reuses the
+/// same channel by setting (and clearing) marker bits. WGSL mirror:
+/// `APPEARANCE_FLAG_SELECTED` in all three shaders (pinned by a test).
+pub const APPEARANCE_FLAG_SELECTED: u32 = 1 << 1;
+
+/// Per-object appearance channel (ui-blueprint spec §6 "视口高亮机制",
+/// plan §3.1): the group(1)/binding(0) override color and marker flags
+/// every uploaded object carries — one fixed 64-byte uniform buffer plus
+/// one bind group per object, provisioned together with the geometry
+/// handles and dropped with them (see [`AppearanceGpu`]).
+///
+/// Colors are linear light RGBA, the same space the pipelines' fragment
+/// stages write to an sRGB target in (per-vertex sRGB colors are converted
+/// to linear in the vertex stage before this channel mixes with them). For
+/// mesh faces the albedo *is* the flat face color (the former WGSL
+/// `FACE_COLOR` constant); for points and lines it replaces the per-vertex
+/// colors only while [`APPEARANCE_FLAG_OVERRIDE`] is set.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Appearance {
+    /// Linear-light RGBA override color (see the type docs for when it
+    /// applies). Callers converting sRGB palette tokens to this space use
+    /// [`Renderer::srgb_to_linear`] per channel.
+    pub albedo: [f32; 4],
+    /// Marker flags: [`APPEARANCE_FLAG_OVERRIDE`], [`APPEARANCE_FLAG_SELECTED`].
+    pub flags: u32,
+}
+
+impl Appearance {
+    /// Neutral appearance: per-vertex colors stay untouched (points,
+    /// lines) and no marker is set. Mesh uploads provision their own
+    /// default albedo on top of this (mesh.rs).
+    pub const DEFAULT: Self = Self {
+        albedo: [0.0, 0.0, 0.0, 1.0],
+        flags: 0,
+    };
+
+    /// Builds an appearance from raw fields.
+    pub const fn new(albedo: [f32; 4], flags: u32) -> Self {
+        Self { albedo, flags }
+    }
+
+    /// A color override from sRGB 8-bit bytes (converted to linear light)
+    /// with [`APPEARANCE_FLAG_OVERRIDE`] set — the palette-token entry
+    /// point for point/line coloring.
+    pub fn srgb_override(color: io::Color) -> Self {
+        Self::new(
+            [
+                Renderer::srgb_to_linear(color.r),
+                Renderer::srgb_to_linear(color.g),
+                Renderer::srgb_to_linear(color.b),
+                1.0,
+            ],
+            APPEARANCE_FLAG_OVERRIDE,
+        )
+    }
+
+    /// This appearance with the selection marker set or cleared
+    /// ([`APPEARANCE_FLAG_SELECTED`]) — the 004 selection / 005 picking
+    /// update path: one in-place queue write, nothing rebuilt.
+    pub const fn with_selected(&self, selected: bool) -> Self {
+        let flags = if selected {
+            self.flags | APPEARANCE_FLAG_SELECTED
+        } else {
+            self.flags & !APPEARANCE_FLAG_SELECTED
+        };
+        Self {
+            albedo: self.albedo,
+            flags,
+        }
+    }
+}
+
+/// Serialize one [`Appearance`] into the fixed 64-byte layout the WGSL
+/// `ObjectAppearance` uniform struct declares: `albedo` at offset 0 as
+/// four little-endian `f32`, `flags` at offset 16 as a little-endian `u32`,
+/// all remaining bytes (padding and the reserved region) zero. A unit test
+/// pins the shader-side member offsets against this packer.
+fn pack_appearance(appearance: &Appearance) -> [u8; APPEARANCE_SIZE_BYTES as usize] {
+    let mut bytes = [0u8; APPEARANCE_SIZE_BYTES as usize];
+    for (index, channel) in appearance.albedo.iter().enumerate() {
+        let start = index * 4;
+        bytes[start..start + 4].copy_from_slice(&channel.to_le_bytes());
+    }
+    bytes[16..20].copy_from_slice(&appearance.flags.to_le_bytes());
+    bytes
+}
+
+/// Entries of the per-object appearance bind group layout shared by every
+/// family pipeline: exactly one — binding 0, the 64-byte appearance uniform
+/// (`@group(1) @binding(0) var<uniform> appearance: ObjectAppearance` in
+/// WGSL). Visible to both shader stages: today the fragment stage mixes the
+/// channel in, and the layout leaves the vertex stage available to later
+/// work (005 and beyond) without relayout.
+fn appearance_bind_group_layout_entries() -> [wgpu::BindGroupLayoutEntry; 1] {
+    [wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }]
+}
+
 /// Vertex attribute of the position buffer (vertex slot 0): `x y z` at
 /// shader location 0. Shared with the mesh and line pipelines
 /// (crate-internal).
@@ -107,6 +230,63 @@ fn pack_view_proj(view_proj: glam::Mat4) -> [u8; 64] {
     bytemuck::cast(view_proj.to_cols_array())
 }
 
+/// GPU side of the per-object appearance channel, provisioned together with
+/// the geometry handles by every upload path (renderer.rs, mesh.rs, line.rs)
+/// and stored as fields of the same mesh struct ([`PointCloudMesh`],
+/// [`crate::render::mesh::MeshMesh`], [`crate::render::line::LineMesh`]):
+/// the channel lives and dies with its mesh handle, so the A6 ledger
+/// semantics of the geometry handle transfer to it unchanged and the
+/// counters module gains no row (plan §3.1 "uniform 与几何句柄同生共死",
+/// §5).
+pub(crate) struct AppearanceGpu {
+    /// The object's fixed 64-byte uniform buffer holding one [`Appearance`].
+    pub uniform_buffer: wgpu::Buffer,
+    /// Bind group referencing `uniform_buffer` at group(1) binding(0),
+    /// created against the renderer's shared appearance bind group layout.
+    pub bind_group: wgpu::BindGroup,
+}
+
+/// Provision one object's appearance uniform buffer plus its group(1) bind
+/// group, initialized to `appearance`. `label` names both resources (the
+/// scene convention: uploads label resources after their kind, e.g.
+/// "line.appearance"). Queue-writes the initial 64 bytes; afterwards only
+/// [`write_appearance`] ever touches the buffer.
+pub(crate) fn create_appearance_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    label: &'static str,
+    appearance: &Appearance,
+) -> AppearanceGpu {
+    let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: APPEARANCE_SIZE_BYTES,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&uniform_buffer, 0, &pack_appearance(appearance));
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform_buffer.as_entire_binding(),
+        }],
+    });
+    AppearanceGpu {
+        uniform_buffer,
+        bind_group,
+    }
+}
+
+/// In-place refresh of one object's appearance uniform: a single 64-byte
+/// queue write into the preallocated buffer. Never creates a buffer or
+/// bind group and never touches a pipeline — appearance changes are object
+/// data, not a rebuild trigger (plan §3.1).
+pub(crate) fn write_appearance(queue: &wgpu::Queue, gpu: &AppearanceGpu, appearance: &Appearance) {
+    queue.write_buffer(&gpu.uniform_buffer, 0, &pack_appearance(appearance));
+}
+
 /// Entries of the scene-wide bind group layout shared by every pipeline and
 /// every mesh of the scene: exactly one — binding 0, the view-projection
 /// uniform (`@group(0) @binding(0) view_proj: mat4x4<f32>` in WGSL).
@@ -142,22 +322,26 @@ fn point_vertex_buffer_layouts() -> [wgpu::VertexBufferLayout<'static>; 2] {
     ]
 }
 
-/// GPU handles of one uploaded point cloud: its two vertex buffers plus the
+/// GPU handles of one uploaded point cloud: its two vertex buffers, the
 /// bind group that references the renderer's scene-wide view-projection
-/// uniform buffer.
+/// uniform buffer, and the per-object appearance channel ([`AppearanceGpu`]).
 ///
 /// The uniform data itself is not per-mesh: [`Renderer`] owns the one
 /// buffer and rewrites it once per frame through [`Renderer::update_uniform`],
 /// so uploading or dropping a cloud never touches the matrix every mesh
-/// sees. Owned by the caller (typically a display type holding it behind an
-/// [`Arc`]); replacing a cloud drops the old mesh and wgpu destroys its
-/// buffers after the frame using them has finished, which satisfies the
-/// safe-replacement requirement of the rendering contract.
+/// sees. The appearance uniform, by contrast, *is* per-mesh — the two
+/// appearance resources ride inside this struct, so they are provisioned
+/// and dropped together with the geometry (plan §3.1). Owned by the caller
+/// (typically a display type holding it behind an [`Arc`]); replacing a
+/// cloud drops the old mesh and wgpu destroys its buffers after the frame
+/// using them has finished, which satisfies the safe-replacement requirement
+/// of the rendering contract.
 pub struct PointCloudMesh {
     positions: wgpu::Buffer,
     colors: wgpu::Buffer,
     count: u32,
     bind_group: wgpu::BindGroup,
+    appearance: AppearanceGpu,
 }
 
 impl PointCloudMesh {
@@ -172,12 +356,14 @@ impl PointCloudMesh {
         colors: wgpu::Buffer,
         count: u32,
         bind_group: wgpu::BindGroup,
+        appearance: AppearanceGpu,
     ) -> Self {
         Self {
             positions,
             colors,
             count,
             bind_group,
+            appearance,
         }
     }
 }
@@ -202,6 +388,12 @@ pub struct Renderer {
     sample_count: u32,
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    /// The per-object appearance bind group layout (group 1, binding 0 —
+    /// the 64-byte [`Appearance`] uniform), shared verbatim by every family
+    /// pipeline, like the scene bind group layout. Per-object uniform
+    /// buffers and bind groups are provisioned against it by the upload
+    /// paths of the family (renderer.rs, mesh.rs, line.rs).
+    appearance_bind_group_layout: wgpu::BindGroupLayout,
     /// The scene's single view-projection uniform buffer, referenced by
     /// every mesh bind group; `update_uniform` rewrites it once per frame.
     uniform_buffer: wgpu::Buffer,
@@ -234,10 +426,18 @@ impl Renderer {
             label: Some("scene"),
             entries: &scene_bind_group_layout_entries(),
         });
+        let appearance_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("appearance"),
+                entries: &appearance_bind_group_layout_entries(),
+            });
 
+        // Two bind groups per pipeline: group 0 is the scene-wide
+        // view-projection uniform, group 1 the per-object appearance
+        // uniform every uploaded mesh carries (ui-blueprint spec §6).
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("point_cloud"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &appearance_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -309,6 +509,7 @@ impl Renderer {
             sample_count,
             pipeline,
             bind_group_layout,
+            appearance_bind_group_layout,
             uniform_buffer,
         }
     }
@@ -358,6 +559,16 @@ impl Renderer {
     /// makes every mesh bind group layout-compatible with every pipeline.
     pub fn scene_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
         &self.bind_group_layout
+    }
+
+    /// The per-object appearance bind group layout (binding 0 of group 1:
+    /// the 64-byte [`Appearance`] uniform), shared verbatim by every family
+    /// pipeline — see [`Renderer::scene_bind_group_layout`]. The upload
+    /// paths provision each object's appearance uniform buffer and bind
+    /// group against this exact layout object, so every mesh bind group is
+    /// layout-compatible with every pipeline.
+    pub fn appearance_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.appearance_bind_group_layout
     }
 
     /// The scene's single view-projection uniform buffer (one 64-byte
@@ -426,11 +637,23 @@ impl Renderer {
             }],
         });
 
+        // The per-object appearance channel rides in the same handle: one
+        // uniform buffer + one bind group, created here and dropped with
+        // the mesh (plan §3.1: uniform 与几何句柄同生共死).
+        let appearance = create_appearance_gpu(
+            &self.device,
+            &self.queue,
+            &self.appearance_bind_group_layout,
+            "point_cloud.appearance",
+            &Appearance::DEFAULT,
+        );
+
         Arc::new(PointCloudMesh {
             positions,
             colors,
             count,
             bind_group,
+            appearance,
         })
     }
 
@@ -439,15 +662,26 @@ impl Renderer {
     /// This never creates, ends, or submits a pass, encoder, or queue
     /// submission: the host (egui-wgpu) opens one pass per frame and submits
     /// once, which the rendering contract requires. Sets the pipeline, the
-    /// mesh's bind group (binding 0: the scene-wide view-projection uniform),
-    /// the two vertex buffers (slot 0 positions, slot 1 colors), and issues
-    /// a single draw of all points as one instance.
+    /// mesh's bind groups (group 0: the scene-wide view-projection uniform;
+    /// group 1: the mesh's appearance uniform), the two vertex buffers
+    /// (slot 0 positions, slot 1 colors), and issues a single draw of all
+    /// points as one instance.
     pub fn paint(&self, pass: &mut wgpu::RenderPass<'static>, mesh: &PointCloudMesh) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &mesh.bind_group, &[]);
+        pass.set_bind_group(1, &mesh.appearance.bind_group, &[]);
         pass.set_vertex_buffer(0, mesh.positions.slice(..));
         pass.set_vertex_buffer(1, mesh.colors.slice(..));
         pass.draw(0..mesh.count, 0..1);
+    }
+
+    /// Refresh the appearance of one uploaded point cloud in place (plan
+    /// §3.1): one 64-byte queue write into the mesh's preallocated uniform
+    /// buffer. Never creates a buffer or bind group and never triggers a
+    /// renderer or scene rebuild; the effect is visible on the next frame.
+    /// The neutral default is [`Appearance::DEFAULT`].
+    pub fn set_appearance(&self, mesh: &PointCloudMesh, appearance: &Appearance) {
+        write_appearance(&self.queue, &mesh.appearance, appearance);
     }
 
     /// Convert one sRGB 8-bit channel to linear light using the standard
@@ -471,6 +705,13 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The line and mesh shader sources, embedded here so the appearance
+    /// channel layout can be pinned once against all three pipelines of the
+    /// scene (their own test modules compile each shader headlessly; this
+    /// module owns the layout parity check).
+    const LINE_SHADER_SOURCE: &str = include_str!("../../assets/shaders/line.wgsl");
+    const MESH_SHADER_SOURCE: &str = include_str!("../../assets/shaders/mesh.wgsl");
 
     /// Compile-time assertion that a type is `bytemuck::Pod`.
     fn assert_pod<T: bytemuck::Pod>() {}
@@ -651,5 +892,252 @@ mod tests {
         assert_eq!(colors.array_stride, COLOR_STRIDE_BYTES);
         assert_eq!(colors.step_mode, wgpu::VertexStepMode::Vertex);
         assert_eq!(colors.attributes, &COLOR_ATTRIBUTES[..]);
+    }
+
+    #[test]
+    fn appearance_packs_into_the_fixed_64_byte_uniform_layout() {
+        // The CPU packer and the WGSL `ObjectAppearance` struct of the three
+        // shaders must agree byte for byte (the shader side is pinned by
+        // `three_shaders_declare_the_same_fixed_appearance_layout`): albedo
+        // at 0 as four little-endian f32, flags at 16 as one little-endian
+        // u32, everything else — the 12-byte implicit padding after flags
+        // and the 32 reserved bytes — zero.
+        let appearance = Appearance::new(
+            [0.1, 0.2, 0.3, 1.0],
+            APPEARANCE_FLAG_OVERRIDE | APPEARANCE_FLAG_SELECTED,
+        );
+        let bytes = pack_appearance(&appearance);
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(bytes.len(), APPEARANCE_SIZE_BYTES as usize);
+        assert_eq!(&bytes[0..4], &0.1f32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &0.2f32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &0.3f32.to_le_bytes());
+        assert_eq!(&bytes[12..16], &1.0f32.to_le_bytes());
+        assert_eq!(
+            &bytes[16..20],
+            &(APPEARANCE_FLAG_OVERRIDE | APPEARANCE_FLAG_SELECTED).to_le_bytes()
+        );
+        assert!(
+            bytes[20..].iter().all(|&b| b == 0),
+            "the padding and reserved region must stay zero"
+        );
+
+        // The neutral default: zero albedo channels, opaque alpha, no flags.
+        let default = pack_appearance(&Appearance::DEFAULT);
+        assert!(default[0..12].iter().all(|&b| b == 0));
+        assert_eq!(&default[12..16], &1.0f32.to_le_bytes());
+        assert!(default[16..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn appearance_bind_group_layout_binds_one_uniform_at_group_one() {
+        // Every family pipeline carries the per-object channel as exactly
+        // one entry at binding 0 — a uniform buffer visible to both shader
+        // stages (the fragment stage mixes the channel today; VERTEX in the
+        // visibility leaves the layout ready for later work without a
+        // relayout). WGSL side: `@group(1) @binding(0)`.
+        let entries = appearance_bind_group_layout_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].binding, 0);
+        assert_eq!(entries[0].visibility, wgpu::ShaderStages::VERTEX_FRAGMENT);
+        assert_eq!(entries[0].count, None);
+        assert_eq!(
+            entries[0].ty,
+            wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            }
+        );
+        assert_eq!(APPEARANCE_SIZE_BYTES, 64);
+    }
+
+    #[test]
+    fn srgb_override_converts_to_linear_light_and_sets_the_flag() {
+        // The palette-token entry point (spec §6): a token's sRGB bytes
+        // reach the shader as linear-light albedo plus the override bit, so
+        // the fragment mixer substitutes them for the per-vertex colors.
+        let color = io::Color {
+            r: 128,
+            g: 64,
+            b: 255,
+        };
+        let appearance = Appearance::srgb_override(color);
+        assert_eq!(appearance.flags, APPEARANCE_FLAG_OVERRIDE);
+        assert_eq!(appearance.albedo[3], 1.0);
+        for (channel, byte) in appearance.albedo[..3].iter().zip([128, 64, 255]) {
+            let expected = Renderer::srgb_to_linear(byte);
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "albedo channel {channel} must equal the CPU srgb_to_linear({byte}) = {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_selected_toggles_only_the_selection_bit() {
+        let base = Appearance::srgb_override(io::Color {
+            r: 10,
+            g: 20,
+            b: 30,
+        });
+        let selected = base.with_selected(true);
+        assert_eq!(
+            selected.flags,
+            APPEARANCE_FLAG_OVERRIDE | APPEARANCE_FLAG_SELECTED,
+            "the override must survive setting the selection marker"
+        );
+        assert_eq!(selected.albedo, base.albedo);
+        assert_eq!(selected.with_selected(false), base, "clearing is lossless");
+        assert_eq!(base.with_selected(false), base);
+    }
+
+    #[test]
+    fn shader_appearance_flags_mirror_the_cpu_constants() {
+        // The WGSL mixers of the scene declare the same flag values and the
+        // same group(1)/binding(0) uniform as the CPU constants above them
+        // (per-file pinning style). Point and line colors are per-vertex, so
+        // their mixers read the override bit; mesh faces have no per-vertex
+        // color, so mesh.wgsl deliberately omits the override path and the
+        // former WGSL `FACE_COLOR` constant is gone entirely.
+        for source in [POINT_CLOUD_SHADER_SOURCE, LINE_SHADER_SOURCE] {
+            assert!(source.contains("const APPEARANCE_FLAG_OVERRIDE: u32 = 1u;"));
+            assert!(source.contains("const APPEARANCE_FLAG_SELECTED: u32 = 2u;"));
+            assert!(source.contains("const HIGHLIGHT_GAIN: f32 = 1.25;"));
+            assert!(source.contains("@group(1) @binding(0)"));
+            assert!(source.contains("var<uniform> appearance: ObjectAppearance;"));
+        }
+        assert!(MESH_SHADER_SOURCE.contains("const APPEARANCE_FLAG_SELECTED: u32 = 2u;"));
+        assert!(MESH_SHADER_SOURCE.contains("const HIGHLIGHT_GAIN: f32 = 1.25;"));
+        assert!(MESH_SHADER_SOURCE.contains("@group(1) @binding(0)"));
+        assert!(
+            !MESH_SHADER_SOURCE.contains("const APPEARANCE_FLAG_OVERRIDE"),
+            "a mesh has no per-vertex color to override — the bit must never be declared \
+             (prose mentions in the comments are fine)"
+        );
+        assert!(
+            !MESH_SHADER_SOURCE.contains("const FACE_COLOR"),
+            "the face color moved into the appearance uniform; a WGSL constant would be a \
+             second color path"
+        );
+
+        assert_eq!(APPEARANCE_FLAG_OVERRIDE, 1);
+        assert_eq!(APPEARANCE_FLAG_SELECTED, 2);
+        assert_eq!(APPEARANCE_FLAG_OVERRIDE & APPEARANCE_FLAG_SELECTED, 0);
+    }
+
+    /// Parse, validate, and walk one shader: exactly one struct must match
+    /// the appearance channel's member list, spanning the fixed 64 bytes
+    /// with the packer's member offsets (albedo 0, flags 16, reserved_a 32,
+    /// reserved_b 48) — the WGSL half of the layout parity `pack_appearance`
+    /// tests on the CPU side.
+    fn assert_appearance_uniform_layout(source: &str) {
+        let module = naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|error| panic!("shader failed to parse:\n{error}"));
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("shader failed naga validation:\n{error}"));
+
+        let member_names = [
+            Some("albedo"),
+            Some("flags"),
+            Some("reserved_a"),
+            Some("reserved_b"),
+        ];
+        let mut matches = 0;
+        for (_, ty) in module.types.iter() {
+            let naga::TypeInner::Struct { members, span } = &ty.inner else {
+                continue;
+            };
+            if !members
+                .iter()
+                .map(|member| member.name.as_deref())
+                .eq(member_names.iter().copied())
+            {
+                continue;
+            }
+            matches += 1;
+            assert_eq!(
+                *span, APPEARANCE_SIZE_BYTES as u32,
+                "the appearance struct must span the fixed 64 bytes"
+            );
+            let offsets: Vec<u32> = members.iter().map(|member| member.offset).collect();
+            assert_eq!(offsets, [0, 16, 32, 48]);
+        }
+        assert_eq!(
+            matches, 1,
+            "each shader declares exactly one appearance struct"
+        );
+    }
+
+    #[test]
+    fn three_shaders_declare_the_same_fixed_appearance_layout() {
+        for source in [
+            POINT_CLOUD_SHADER_SOURCE,
+            LINE_SHADER_SOURCE,
+            MESH_SHADER_SOURCE,
+        ] {
+            assert_appearance_uniform_layout(source);
+        }
+    }
+
+    #[test]
+    fn appearance_channel_fifty_round_cycle_stays_byte_deterministic() {
+        // Headless 50-round regression of the appearance lifecycle the A6
+        // ledger test models with real handles (counters.rs): a scene object
+        // is added with a neutral appearance, toggles its selection marker
+        // and gets recolored, and is dropped back to neutral. This file has
+        // no device (CI runs GPU-less), so the cycle runs over the CPU
+        // packer — the byte stream every `create_appearance_gpu`/
+        // `write_appearance` queue-writes — and pins that the 50 rounds
+        // never accumulate state: each round's bytes are bit-identical to
+        // round zero's, flags are exactly the two documented bits, and the
+        // packed size never leaves 64 bytes. The created==destroyed ledger
+        // balance itself stays the counters.rs test's job.
+        let neutral = pack_appearance(&Appearance::DEFAULT);
+        assert_eq!(neutral.len(), APPEARANCE_SIZE_BYTES as usize);
+        let neutral_flags = u32::from_le_bytes(neutral[16..20].try_into().unwrap());
+        assert_eq!(neutral_flags, 0);
+
+        for round in 0..50u32 {
+            // "Add": an object appears with a neutral appearance — the byte
+            // stream of round zero, exactly, every round.
+            assert_eq!(pack_appearance(&Appearance::DEFAULT), neutral);
+
+            // Ten marker toggles plus one recolor (the frame-rate poll of
+            // the A12 performance protocol is a same-channel cycle): every
+            // write is a valid 64-byte stream carrying exactly the two
+            // documented bits.
+            let mut appearance = Appearance::new(
+                [
+                    Renderer::srgb_to_linear((round % 251) as u8),
+                    Renderer::srgb_to_linear(77),
+                    Renderer::srgb_to_linear(149),
+                    1.0,
+                ],
+                APPEARANCE_FLAG_OVERRIDE,
+            );
+            for step in 0..10u32 {
+                appearance = appearance.with_selected(step % 2 == 0);
+                let bytes = pack_appearance(&appearance);
+                assert_eq!(bytes.len(), APPEARANCE_SIZE_BYTES as usize);
+                let flags = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+                let expected = APPEARANCE_FLAG_OVERRIDE
+                    | if step % 2 == 0 {
+                        APPEARANCE_FLAG_SELECTED
+                    } else {
+                        0
+                    };
+                assert_eq!(flags, expected, "round {round} step {step}");
+            }
+
+            // "Drop": the object leaves — back to the identical neutral
+            // stream; 50 rounds leave no residue behind.
+            assert_eq!(pack_appearance(&Appearance::DEFAULT), neutral);
+        }
     }
 }

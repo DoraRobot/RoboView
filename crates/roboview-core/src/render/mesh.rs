@@ -1,6 +1,11 @@
 //! Mesh pipeline (display-types spec §7 F1, §6): triangle rendering with
-//! CPU-computed face normals, constant face color, and a shared-depth
-//! polygon offset.
+//! CPU-computed face normals, a per-object face color uniform, and a
+//! shared-depth polygon offset. The unlit face color moved from a WGSL
+//! constant (`FACE_COLOR`) to the per-object appearance channel
+//! (ui-blueprint spec §6, plan §3.1) — every mesh upload provisions a
+//! 64-byte appearance uniform (renderer.rs) whose albedo is the flat face
+//! color, so a mesh recoloring or the selection highlight is one in-place
+//! queue write, never a re-upload or rebuild.
 //!
 //! The upload side expands every face into three standalone vertices (no
 //! index buffer — the spec's ruling: "face normals are computed CPU-side,
@@ -46,8 +51,8 @@ use glam::Vec3;
 
 use super::counters;
 use super::renderer::{
-    POSITION_ATTRIBUTES, POSITION_STRIDE_BYTES, PointCloudMesh, Renderer, pack_colors,
-    pack_positions,
+    Appearance, AppearanceGpu, POSITION_ATTRIBUTES, POSITION_STRIDE_BYTES, PointCloudMesh,
+    Renderer, create_appearance_gpu, pack_colors, pack_positions, write_appearance,
 };
 use crate::displays::DisplayKind;
 use crate::io;
@@ -74,6 +79,13 @@ const NORMAL_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
 const DEPTH_BIAS_CONSTANT: i32 = 4;
 const DEPTH_BIAS_SLOPE_SCALE: f32 = 1.0;
 const DEPTH_BIAS_CLAMP: f32 = 0.0;
+
+/// Default face color of the unlit mesh pipeline as linear light, opaque —
+/// the former WGSL `FACE_COLOR` constant, now the CPU-side albedo of the
+/// default appearance every surface-mesh upload provisions (the shader
+/// reads the uniform; see the module docs). Linear (0.7, 0.75, 0.8) ≈ sRGB
+/// (0.854, 0.881, 0.906), a light neutral gray.
+const DEFAULT_MESH_FACE_COLOR: [f32; 4] = [0.7, 0.75, 0.8, 1.0];
 
 /// The mesh pipeline's vertex buffer layouts, in slot order: slot 0
 /// positions (tightly packed `f32` triples), slot 1 face normals (same
@@ -164,11 +176,14 @@ fn expand_faces(positions: &[Vec3], indices: &[u32]) -> ExpandedFaces {
 }
 
 /// GPU handles of one uploaded surface mesh: its two vertex buffers (slot 0
-/// duplicated face corners, slot 1 their unit face normals) plus the bind
-/// group referencing the renderer's scene-wide view-projection uniform
-/// buffer. Owned by the caller (a mesh display behind an [`Arc`]); dropping
-/// it frees the buffers through wgpu's deferred destruction, exactly like
-/// [`PointCloudMesh`].
+/// duplicated face corners, slot 1 their unit face normals), the bind group
+/// referencing the renderer's scene-wide view-projection uniform buffer,
+/// and the per-object appearance channel ([`AppearanceGpu`]) whose albedo
+/// is the face color. Owned by the caller (a mesh display behind an
+/// [`Arc`]); dropping it frees the buffers through wgpu's deferred
+/// destruction, exactly like [`PointCloudMesh`]. The appearance resources
+/// ride inside this struct, so they are provisioned and dropped together
+/// with the geometry (plan §3.1).
 pub struct MeshMesh {
     positions: wgpu::Buffer,
     normals: wgpu::Buffer,
@@ -176,6 +191,7 @@ pub struct MeshMesh {
     /// mesh — the draw call is then a harmless no-op).
     count: u32,
     bind_group: wgpu::BindGroup,
+    appearance: AppearanceGpu,
 }
 
 /// The uploaded GPU form of a mesh display (spec §7 F1): one of two shapes,
@@ -197,6 +213,7 @@ pub struct MeshPipeline {
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    appearance_bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
 }
 
@@ -216,9 +233,12 @@ impl MeshPipeline {
         });
 
         let bind_group_layout = renderer.scene_bind_group_layout();
+        let appearance_bind_group_layout = renderer.appearance_bind_group_layout();
+        // Two bind groups per pipeline: group 0 the scene-wide view-proj
+        // uniform, group 1 the per-object appearance uniform (spec §6).
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh"),
-            bind_group_layouts: &[bind_group_layout],
+            bind_group_layouts: &[bind_group_layout, appearance_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -276,6 +296,7 @@ impl MeshPipeline {
             queue: renderer.queue().clone(),
             pipeline,
             bind_group_layout: renderer.scene_bind_group_layout().clone(),
+            appearance_bind_group_layout: renderer.appearance_bind_group_layout().clone(),
             uniform_buffer: renderer.uniform_buffer().clone(),
         }
     }
@@ -322,11 +343,24 @@ impl MeshPipeline {
         self.queue.write_buffer(&normals, 0, &normal_bytes);
 
         let bind_group = self.bind_group();
+
+        // The per-object appearance channel rides in the same handle; its
+        // default albedo reproduces the former WGSL FACE_COLOR constant, so
+        // an upload without appearance calls looks exactly as before.
+        let appearance = create_appearance_gpu(
+            &self.device,
+            &self.queue,
+            &self.appearance_bind_group_layout,
+            "mesh.appearance",
+            &Appearance::new(DEFAULT_MESH_FACE_COLOR, 0),
+        );
+
         Arc::new(MeshMesh {
             positions,
             normals,
             count,
             bind_group,
+            appearance,
         })
     }
 
@@ -360,8 +394,20 @@ impl MeshPipeline {
         self.queue.write_buffer(&colors, 0, &color_bytes);
 
         let bind_group = self.bind_group();
+
+        // Scatter points have no per-vertex semantic colors of their own
+        // (uploaded with the default point color), so their appearance
+        // channel starts neutral like a point cloud's.
+        let appearance = create_appearance_gpu(
+            &self.device,
+            &self.queue,
+            &self.appearance_bind_group_layout,
+            "mesh.scatter.appearance",
+            &Appearance::DEFAULT,
+        );
+
         Arc::new(PointCloudMesh::from_parts(
-            positions, colors, count, bind_group,
+            positions, colors, count, bind_group, appearance,
         ))
     }
 
@@ -380,15 +426,29 @@ impl MeshPipeline {
 
     /// Record the draw of one surface mesh into an externally opened render
     /// pass (mirrors [`crate::render::Renderer::paint`]: records commands
-    /// only, never creates or submits a pass or encoder). Draws all
-    /// duplicated vertices as one triangle-list instance; a mesh whose
-    /// upload kept no face draws nothing.
+    /// only, never creates or submits a pass or encoder). Sets the pipeline,
+    /// the mesh's bind groups (group 0: view-proj; group 1: the appearance
+    /// uniform whose albedo is the face color), the two vertex buffers, and
+    /// draws all duplicated vertices as one triangle-list instance; a mesh
+    /// whose upload kept no face draws nothing.
     pub fn paint(&self, pass: &mut wgpu::RenderPass<'static>, mesh: &MeshMesh) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &mesh.bind_group, &[]);
+        pass.set_bind_group(1, &mesh.appearance.bind_group, &[]);
         pass.set_vertex_buffer(0, mesh.positions.slice(..));
         pass.set_vertex_buffer(1, mesh.normals.slice(..));
         pass.draw(0..mesh.count, 0..1);
+    }
+
+    /// Refresh the face color and markers of one surface mesh in place
+    /// (plan §3.1): one 64-byte queue write into the mesh's preallocated
+    /// appearance uniform — recoloring (002 property editing) and the 004
+    /// selection highlight never re-upload geometry or rebuild anything.
+    /// Scatter-shaped meshes ([`MeshGpu::Scatter`]) are drawn by the point
+    /// pipeline and are updated through [`Renderer::set_appearance`]
+    /// instead.
+    pub fn set_appearance(&self, mesh: &MeshMesh, appearance: &Appearance) {
+        write_appearance(&self.queue, &mesh.appearance, appearance);
     }
 }
 
@@ -538,5 +598,28 @@ mod tests {
         validator
             .validate(&module)
             .unwrap_or_else(|error| panic!("mesh.wgsl failed naga validation:\n{error}"));
+    }
+
+    #[test]
+    fn default_mesh_face_color_pins_the_moved_wgsl_constant() {
+        // The former WGSL `FACE_COLOR` constant moved to the CPU side of
+        // the appearance channel (ui-blueprint plan §3.1): linear light
+        // (0.7, 0.75, 0.8, 1.0) ≈ sRGB (0.854, 0.881, 0.906), a light
+        // neutral gray. It is the albedo every surface-mesh upload
+        // provisions, so an upload without appearance calls renders exactly
+        // as before the move.
+        assert_eq!(DEFAULT_MESH_FACE_COLOR, [0.7, 0.75, 0.8, 1.0]);
+
+        // The shader reads the uniform now, and the old WGSL constant is
+        // gone as code (the module docs may still mention `FACE_COLOR` in
+        // prose) — a second color path must never come back.
+        assert!(
+            MESH_SHADER_SOURCE.contains("appearance.albedo"),
+            "mesh.wgsl must take its color from the appearance uniform"
+        );
+        assert!(
+            !MESH_SHADER_SOURCE.contains("const FACE_COLOR"),
+            "the color moved to the uniform; a WGSL constant would be a second color path"
+        );
     }
 }

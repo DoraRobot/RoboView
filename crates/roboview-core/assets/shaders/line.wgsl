@@ -26,6 +26,15 @@
 //   equal depth — and lines never punch holes into the depth buffer that
 //   would hide geometry drawn later. Polygons offsets do not apply to line
 //   primitives in any case (spec: lines use strict Less, without bias).
+//
+// - Per-object appearance channel (004 ui-blueprint plan §3.1): group(1)
+//   binding(0) carries one fixed 64-byte uniform per mesh handle, mixed over
+//   the vertex color in the fragment stage — bit 0 of `flags` replaces the
+//   per-vertex colors with the albedo (the selection/semantic-color path the
+//   app drives for frames and helpers), bit 1 boosts the surviving color as
+//   a selection highlight. The albedo arrives in linear light, exactly like
+//   the vertex colors after `srgb_to_linear`, so the two mixing branches sit
+//   in the same space (the sRGB target re-encodes on store).
 
 /// Standard sRGB EOTF (IEC 61966-2-1): linear below the 0.04045 knee,
 /// gamma 2.4 above it. Mirrors `Renderer::srgb_to_linear` exactly.
@@ -36,13 +45,59 @@ fn srgb_to_linear(c: f32) -> f32 {
     return pow((c + 0.055) / 1.055, 2.4);
 }
 
-struct VsOut {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) color: vec4<f32>,
+/// When set in `appearance.flags`, the albedo replaces the per-vertex color
+/// entirely. Mirrors `Appearance::srgb_override` (renderer.rs): the override
+/// color is the object's semantic color, baked CPU-side into the uniform.
+const APPEARANCE_FLAG_OVERRIDE: u32 = 1u;
+
+/// When set in `appearance.flags`, the surviving linear color is boosted by
+/// `HIGHLIGHT_GAIN` (selection highlight, spec §6). Mirrors
+/// `Appearance::with_selected` and the `APPEARANCE_FLAG_SELECTED` constant
+/// of renderer.rs.
+const APPEARANCE_FLAG_SELECTED: u32 = 2u;
+
+/// Selection-highlight gain applied to `color.rgb` (linear light), clamped
+/// to white; alpha is untouched so highlights never change coverage.
+const HIGHLIGHT_GAIN: f32 = 1.25;
+
+/// Fixed 64-byte per-object appearance uniform (plan §3.1; byte layout
+/// mirrored by `pack_appearance` in renderer.rs): `albedo` at 0, `flags` at
+/// 16, the two reserved vec4 slots padding the struct to 64 bytes.
+struct ObjectAppearance {
+    /// Linear-light replacement color (bit `APPEARANCE_FLAG_OVERRIDE`);
+    /// unused while the flag is clear, when the per-vertex color wins.
+    albedo: vec4<f32>,
+    /// Appearance flags: `APPEARANCE_FLAG_OVERRIDE` | `APPEARANCE_FLAG_SELECTED`.
+    flags: u32,
+    reserved_a: vec4<f32>,
+    reserved_b: vec4<f32>,
 }
 
 @group(0) @binding(0)
 var<uniform> view_proj: mat4x4<f32>;
+
+@group(1) @binding(0)
+var<uniform> appearance: ObjectAppearance;
+
+/// Mix the appearance channel over one vertex color (already linear): the
+/// override replaces it wholesale, the selection bit highlights whatever
+/// survives. Both rules compose — a selected overridden mesh highlights its
+/// override albedo.
+fn mix_appearance(color: vec4<f32>) -> vec4<f32> {
+    var out = color;
+    if (appearance.flags & APPEARANCE_FLAG_OVERRIDE) != 0u {
+        out = appearance.albedo;
+    }
+    if (appearance.flags & APPEARANCE_FLAG_SELECTED) != 0u {
+        out = vec4<f32>(min(out.rgb * vec3<f32>(HIGHLIGHT_GAIN), vec3<f32>(1.0)), out.a);
+    }
+    return out;
+}
+
+struct VsOut {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+}
 
 @vertex
 fn vs_main(
@@ -62,5 +117,5 @@ fn vs_main(
 
 @fragment
 fn fs_main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> {
-    return color;
+    return mix_appearance(color);
 }
