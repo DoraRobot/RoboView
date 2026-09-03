@@ -1208,7 +1208,7 @@ mod tests {
     #[test]
     fn row_speed_follows_the_measurable_scene_scale() {
         // A measurable mesh scales the drag speed up proportionally.
-        let (scene, _) = scene_with(mesh_with_bounds(), "scan.obj"); // A9: fixture name
+        let (scene, _) = scene_with(mesh_with_bounds(), "scan.obj"); // A9: test-fixture file name
         assert!(
             (row_speed(&scene) - 0.2).abs() < f32::EPSILON,
             "100 m largest dimension → 100 × 0.002 = 0.2, got {}",
@@ -1232,7 +1232,7 @@ mod tests {
 
         // Objects without bounds — and an empty scene — fall back to the
         // dialogs' default (frames and markers never join the union).
-        let (scene, _) = scene_with(mesh(), "solid.obj");
+        let (scene, _) = scene_with(mesh(), "solid.obj"); // A9: test-fixture name
         assert_eq!(row_speed(&scene), FALLBACK_DRAG_SPEED, "no bounds");
         let (scene, _) = scene_with(DisplayObject::Frame(Frame::new(Vec3::ZERO, 1.0)), "frame");
         assert_eq!(row_speed(&scene), FALLBACK_DRAG_SPEED, "frames never bound");

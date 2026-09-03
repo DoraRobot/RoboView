@@ -64,7 +64,7 @@ use roboview_core::io::{self, LoadError, LoadedObject};
 use roboview_core::scene::camera::OrbitCamera;
 
 use ui::menu::AppAction;
-use ui::objects_panel::{self, AddFrameDialog, AddMarkerDialog, ObjectsPanelState};
+use ui::objects_panel::{self, ObjectsPanelState};
 use ui::properties_panel;
 use ui::status_bar::{MessageItem, MessageLevel, StatusBar, StatusInfo, TOOL_NAVIGATE};
 use ui::texts;
@@ -197,10 +197,6 @@ struct RoboViewApp {
     locale: texts::Locale,
     /// Structured error event of the non-modal error window; `None` hides it.
     error: Option<ErrorEvent>,
-    /// The Add frame dialog of the objects panel (spec §7 F3).
-    add_frame_dialog: AddFrameDialog,
-    /// The Add marker dialog of the objects panel (spec §7 F4).
-    add_marker_dialog: AddMarkerDialog,
     /// Tree-side state of the objects panel (search filter, group
     /// collapse/colors, selection label) — 004 app-owned subject (T12).
     objects_state: ObjectsPanelState,
@@ -248,8 +244,6 @@ impl RoboViewApp {
             load: None,
             locale,
             error: None,
-            add_frame_dialog: AddFrameDialog::new(),
-            add_marker_dialog: AddMarkerDialog::new(),
             objects_state: ObjectsPanelState::default(),
             status_bar: StatusBar::new(),
             messages: Vec::new(),
@@ -316,11 +310,11 @@ impl RoboViewApp {
             AppAction::Open => self.open_any_dialog(ctx),
             AppAction::AddFrame => {
                 let (center, scale) = viewport::lock_state(&self.viewport).ui_defaults();
-                self.add_frame_dialog.open(center, scale);
+                self.objects_state.open_add_frame(center, scale);
             }
             AppAction::AddMarker => {
                 let (center, scale) = viewport::lock_state(&self.viewport).ui_defaults();
-                self.add_marker_dialog.open(center, scale);
+                self.objects_state.open_add_marker(center, scale);
             }
             AppAction::Language(locale) => {
                 self.locale = locale;
@@ -502,10 +496,27 @@ impl RoboViewApp {
             .pending_object
             .take()
             .expect("pending_object checked above");
+        let kind = loaded_kind(&pending.object);
         let installed =
             viewport::lock_state(&self.viewport).install_object(pending.object, &pending.name);
         if installed {
             tracing::info!(name = %pending.name, "object added to the scene");
+            // Group default color for a *new* member (D4: new members
+            // only). Applied to the colorable kinds — point cloud, mesh,
+            // path — through the appearance channel; frames keep the 002
+            // semantic axis colors (no override) and markers have no own
+            // color (T16-2 note). The viewport registry already synced the
+            // tree's per-kind defaults and reports the unset sentinel when
+            // none is configured.
+            if let Some(id) = viewport::lock_state(&self.viewport)
+                .scene
+                .iter()
+                .last()
+                .map(|o| o.id)
+            {
+                let mut lock = viewport::lock_state(&self.viewport);
+                lock.apply_new_member_default_color(id, kind);
+            }
             self.error = None;
         } else {
             // Invariant violation (renderer_ready just said yes); the
@@ -691,13 +702,20 @@ impl RoboViewApp {
         if output.fit {
             self.fit_scene();
         }
-        if output.open_add_frame {
-            let (center, scale) = viewport::lock_state(&self.viewport).ui_defaults();
-            self.add_frame_dialog.open(center, scale);
+        if let Some((origin, length)) = output.add_frame {
+            viewport::lock_state(&self.viewport).add_frame(origin, length);
         }
-        if output.open_add_marker {
-            let (center, scale) = viewport::lock_state(&self.viewport).ui_defaults();
-            self.add_marker_dialog.open(center, scale);
+        if let Some(marker) = output.add_marker {
+            viewport::lock_state(&self.viewport).add_marker(marker);
+        }
+        // Group default colors → the viewport registry (T16-2), read on
+        // new-member creation (D4: new members only; the tree owns the
+        // per-kind defaults and only user-set entries appear here).
+        if !self.objects_state.group_default_color.is_empty() {
+            let mut lock = viewport::lock_state(&self.viewport);
+            for (kind, color) in &self.objects_state.group_default_color {
+                lock.set_group_default_color(*kind, *color);
+            }
         }
     }
 
@@ -709,16 +727,30 @@ impl RoboViewApp {
     /// viewport sliver (spec A13).
     fn properties_panel(&mut self, ctx: &egui::Context) {
         let frame = region_frame(&ctx.style());
-        egui::SidePanel::right(egui::Id::new("properties_panel"))
+        let output = egui::SidePanel::right(egui::Id::new("properties_panel"))
             .resizable(true)
             .default_width(220.0)
             .width_range(200.0..=360.0)
             .frame(frame)
             .show(ctx, |ui| {
                 let lock = viewport::lock_state(&self.viewport);
-                let _output =
-                    properties_panel::ui(ui, self.objects_state.selected, &lock.scene, self.locale);
-            });
+                properties_panel::ui(ui, self.objects_state.selected, &lock.scene, self.locale)
+            })
+            .inner;
+        // Commit this frame's property edits (T16-1 output → the viewport
+        // single-object service): ≤1 frame effect (A3/A4). Fields go through
+        // apply_object_edits, the color row through the appearance channel.
+        for edit in output.edits {
+            let mut lock = viewport::lock_state(&self.viewport);
+            lock.apply_object_edits(edit.id, &edit.fields);
+            if let Some(color) = edit.color {
+                lock.appearance_override(edit.id, color);
+            }
+        }
+        // Selection mirror → viewport highlight (A2): the tree is the
+        // selection source; the viewport follows within one frame. The
+        // call is idempotent (no-op on an unchanged selection).
+        viewport::lock_state(&self.viewport).set_selected(self.objects_state.selected);
     }
 
     /// The bottom status region of the four-region skeleton (004 spec
@@ -840,11 +872,19 @@ impl eframe::App for RoboViewApp {
                 viewport::show_viewport(ui, &viewport_state, loading, self.locale);
             });
 
-        // 5. Floating windows on top of the panels.
+        // 5. Floating windows on top of the panels (the add dialogs are
+        // gone — A5: the panel's inline forms replace them).
         self.error_window(ctx);
-        self.add_frame_dialog.show(ctx, &self.viewport, self.locale);
-        self.add_marker_dialog
-            .show(ctx, &self.viewport, self.locale);
+    }
+}
+
+/// The display kind of a loaded object (group-default color injection,
+/// T16-3).
+fn loaded_kind(object: &LoadedObject) -> roboview_core::displays::DisplayKind {
+    match object {
+        LoadedObject::PointCloud(_) => roboview_core::displays::DisplayKind::PointCloud,
+        LoadedObject::Mesh(_) => roboview_core::displays::DisplayKind::Mesh,
+        LoadedObject::Path(_) => roboview_core::displays::DisplayKind::Path,
     }
 }
 

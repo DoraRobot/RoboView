@@ -1583,10 +1583,7 @@ mod tests {
     #[test]
     fn commit_add_marker_requires_text_and_keeps_the_form_open() {
         let mut state = ObjectsPanelState::default();
-        assert!(
-            state.commit_add_marker().is_none(),
-            "no marker form open"
-        );
+        assert!(state.commit_add_marker().is_none(), "no marker form open");
 
         state.open_add_marker(Vec3::new(0.0, 1.0, 0.0), 2.0);
         assert!(

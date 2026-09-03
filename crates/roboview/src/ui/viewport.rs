@@ -557,6 +557,7 @@ impl ViewportState {
     /// albedo) plus the selection flag while the object is selected. Same
     /// cost and A6 story as [`ViewportState::appearance_override`]. A
     /// repeat clear without an active override is a no-op.
+    #[allow(dead_code)] // reserved: color-row clear/readback (007 / property polish)
     pub fn clear_appearance_override(&mut self, id: u64) {
         self.prune_appearance_registry();
         if self.appearances.remove(&id).is_none() {
@@ -578,6 +579,7 @@ impl ViewportState {
     /// mesh/point-cloud color row (plan §3.5: this replaces the read-only
     /// token the panel displayed before the registry existed). The albedo
     /// is linear light, same as the uniform.
+    #[allow(dead_code)] // reserved: properties color-row readback (T16-1 note)
     pub fn appearance_of(&self, id: u64) -> Option<Appearance> {
         self.appearances.get(&id).copied()
     }
@@ -742,6 +744,17 @@ impl ViewportState {
             .get(&kind)
             .copied()
             .unwrap_or(GROUP_COLOR_UNSET)
+    }
+
+    /// Apply the group's configured default color to a freshly added member
+    /// (D4: new members only). A no-op when the group has none — the unset
+    /// sentinel equals the objects-panel marker. Colorable kinds only (the
+    /// file-install caller never hands over frame/marker kinds).
+    pub fn apply_new_member_default_color(&mut self, id: u64, kind: DisplayKind) {
+        let default = self.appearance_default_for_new(kind);
+        if default != GROUP_COLOR_UNSET {
+            self.appearance_override(id, default);
+        }
     }
 
     /// Write one appearance composite into the GPU uniform of `id` — an
