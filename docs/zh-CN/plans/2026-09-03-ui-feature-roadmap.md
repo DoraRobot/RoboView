@@ -8,10 +8,10 @@
 
 ## 范围
 
-登记已完成基础设施阶段（001 point-cloud-viewport、002 display-types、
-003 i18n-system-fonts）之后的 UI 功能序列。各阶段 spec 位于
-`docs/specs/NNN-name/`；功能细节、评审结果与验收声明以各 spec 为准——
-本文档只记录序列与依赖边。
+登记已完成基础设施阶段（001 point-cloud-viewport、002 display-types 已闭环；
+003 i18n-system-fonts 已实现、全矩阵 CI 验收待确认）之后、以及已登记 UI 阶段的
+功能序列。各阶段 spec 位于 `docs/specs/NNN-name/`；功能细节、评审结果与验收声明以
+各 spec 为准——本文档只记录序列与依赖边。
 
 ## 序列与依赖
 

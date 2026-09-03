@@ -9,9 +9,10 @@ Related: CONSTITUTION §1.9, §4.1; ADR 004, ADR 006; `docs/specs/001-point-clou
 ## Scope
 
 Records the UI feature sequence that follows the closed infrastructure phases
-(001 point-cloud-viewport, 002 display-types, 003 i18n-system-fonts). Phase
-specs live in `docs/specs/NNN-name/`; feature-level detail, review results and
-acceptance claims are governed there — this document records sequence and
+(001 point-cloud-viewport, 002 display-types closed; 003 i18n-system-fonts
+implemented, full-matrix CI acceptance pending) and the registered UI phases.
+Phase specs live in `docs/specs/NNN-name/`; feature-level detail, review results
+and acceptance claims are governed there — this document records sequence and
 dependency edges only.
 
 ## Sequence and Dependencies
@@ -36,7 +37,7 @@ Implementation order: 004 → 005 → 006 → 007 → 008 → 009.
 
 - 008/009 were confirmed by the owner on 2026-09-03 following the gap analysis
   against mature 3D tool conventions (008 registered in the 005 non-goals as
-  "toolchain item 008"; 009 in the 004 non-goals as "toolchain item 009");
+  "路线图序号 008"; 009 in the 004 non-goals as "路线图序号 009");
   spec drafts created the same day at `docs/specs/008-object-transform/` and
   `docs/specs/009-timeline/` (Draft, decision points open).
 - Each phase follows the SDD workflow: spec → plan → tasks; four-lens review
