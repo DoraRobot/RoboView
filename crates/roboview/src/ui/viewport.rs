@@ -154,7 +154,7 @@ const GRID_RADIUS_MARGIN: f32 = 1.05;
 /// Fixed world length (m) of the world-origin axis trio (spec §6:
 /// "示意长度固定" — one major grid cell). World-fixed geometry never needs
 /// a camera-driven refresh, unlike the windowed grid.
-const ORIGIN_AXIS_LENGTH: f32 = 1.0;
+const ORIGIN_AXIS_LENGTH: f32 = 3.0;
 /// Radius (points) of the orientation indicator's backdrop disc.
 const INDICATOR_RADIUS: f32 = 30.0;
 /// Distance (points) of the indicator disc center from the top-right
@@ -1495,10 +1495,11 @@ pub fn show_viewport(
         };
         painter.add(egui_wgpu::Callback::new_paint_callback(rect, callback));
 
-        // Overlay pass: marker text labels, frame axis letters, and the
-        // corner orientation indicator, painted after the 3D callback so
-        // they always sit on top (spec §6).
+        // Overlay pass: marker text labels, frame axis letters, the world-
+        // origin axis letters, and the corner orientation indicator,
+        // painted after the 3D callback so they always sit on top (spec §6).
         paint_labels(&painter, rect, state);
+        paint_origin_axis_labels(&painter, rect, state);
         paint_indicator(&painter, rect, state);
     }
 
@@ -1526,15 +1527,10 @@ pub fn show_viewport(
                 egui::FontId::proportional(16.0),
                 ui.visuals().weak_text_color(),
             );
-        } else {
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                texts::viewport_empty_hint(locale),
-                egui::FontId::proportional(18.0),
-                ui.visuals().weak_text_color(),
-            );
         }
+        // (no empty-scene hint text — the helper layer alone reads as a
+        // scene; the empty-state copy surface stays in texts.rs for the
+        // 007 message center)
     } else if loading {
         // Content is present and a load keeps running: a subtle hint in
         // the corner while the scene stays interactive.
@@ -1738,6 +1734,58 @@ fn paint_label(
 /// geometry guard mirrors the line pipeline's upload guard: frames with
 /// non-finite origins or non-positive lengths draw no geometry and get no
 /// letters either.
+
+/// Overlay letters of the world-origin axis trio (X red / Y green / Z
+/// blue, the 002 semantic colors at the fixed `ORIGIN_AXIS_LENGTH`),
+/// projected per frame like the frame labels — so the default view reads
+/// its three axes at a glance.
+fn paint_origin_axis_labels(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    state: &Arc<Mutex<ViewportState>>,
+) {
+    let lock = lock_state(state);
+    if !lock.axes_on() {
+        return;
+    }
+    let (view_proj, view_rect) = (
+        lock.scene
+            .camera
+            .view_proj(rect.width() / rect.height().max(1.0)),
+        rect,
+    );
+    drop(lock);
+    let tips = [
+        (
+            Vec3::X * ORIGIN_AXIS_LENGTH,
+            texts::AXIS_X,
+            theme::to_color32(theme::ORIGIN_AXIS.0),
+        ),
+        (
+            Vec3::Y * ORIGIN_AXIS_LENGTH,
+            texts::AXIS_Y,
+            theme::to_color32(theme::ORIGIN_AXIS.1),
+        ),
+        (
+            Vec3::Z * ORIGIN_AXIS_LENGTH,
+            texts::AXIS_Z,
+            theme::to_color32(theme::ORIGIN_AXIS.2),
+        ),
+    ];
+    let axis_font = egui::FontId::proportional(13.0);
+    for (tip, letter, color) in tips {
+        if let Some(pos) = anchor_pos(&view_proj, view_rect, tip) {
+            painter.text(
+                pos + egui::vec2(3.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                letter,
+                axis_font.clone(),
+                color,
+            );
+        }
+    }
+}
+
 fn paint_frame_axis_labels(
     painter: &egui::Painter,
     view_proj: &Mat4,

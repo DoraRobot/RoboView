@@ -805,6 +805,7 @@ pub fn file_dialog_filter_path(locale: Locale) -> &'static str {
 }
 
 /// Hint shown in the center of the viewport while the scene holds no object.
+#[allow(dead_code)] // kept: empty-state copy surface (007 message center may reuse)
 pub fn viewport_empty_hint(locale: Locale) -> &'static str {
     resolve(locale, TextKey::ViewportEmptyHint)
 }
