@@ -31,7 +31,7 @@
 ## 备注
 
 - 实现开始条件：本清单创建即满足（spec/plan 已 Approved）；负责人指示后开工。
-- MAN 记录存 `.leon`（003 验收归档）；CI 预装 fonts-noto-cjk 依赖 curl/apt 网络（受限时按私有代理规则）。
+- MAN 记录存 `.leon`（003 验收归档）；CI 预装 fonts-noto-cjk 依赖 curl/apt 联网拉取（需网络可用）。
 - 性能记录口径：M5/A7 以 A11 协议（`001-point-cloud-viewport spec.md`）为模板。
 
 ## 完成记录
