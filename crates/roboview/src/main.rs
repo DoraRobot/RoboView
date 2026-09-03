@@ -731,7 +731,7 @@ impl RoboViewApp {
         // the single text row stays unclipped (status_bar module doc).
         let frame = egui::Frame::side_top_panel(&ctx.style())
             .fill(theme::PANEL_BACKGROUND)
-            .inner_margin(egui::Margin::symmetric(8.0, 2.0));
+            .inner_margin(egui::Margin::symmetric(8, 2));
         // Pointer-world intersection from the viewport layer: the frame's
         // stored rect and pointer, reference plane Z=0 while the grid is
         // shown and the camera-target plane while hidden.
