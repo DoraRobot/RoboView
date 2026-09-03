@@ -2,6 +2,7 @@
 
 pub mod camera_input;
 pub mod fonts;
+pub mod menu_bridge;
 pub mod objects_panel;
 pub mod texts;
 pub mod viewport;

@@ -134,6 +134,13 @@ enum ErrorEvent {
 
 /// The RoboView application: window shell + viewport state.
 struct RoboViewApp {
+    /// Native macOS menu bridge (004 spike T2): keeps the muda menu tree
+    /// alive for the whole process lifetime and drains its event queue once
+    /// per frame. Always `Some` after a macOS launch; `None` only if a
+    /// bridge was already registered.
+    #[cfg(target_os = "macos")]
+    native_menu_bridge: Option<ui::menu_bridge::BridgeCtx>,
+
     /// Scene, renderer, and per-frame rect, shared with the wgpu paint
     /// callback registered by the viewport panel each frame.
     viewport: Arc<Mutex<ViewportState>>,
@@ -158,6 +165,13 @@ struct RoboViewApp {
 
 impl RoboViewApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Native macOS menu bar (004 spec §6, wiring spike T2): install the
+        // muda bridge as early as possible in App::new — winit has already
+        // installed its default menu at `applicationDidFinishLaunching`, so
+        // `init_for_nsapp` replaces it before the first frame. The app
+        // struct keeps the bridge (and thus the menu tree) alive.
+        #[cfg(target_os = "macos")]
+        let native_menu_bridge = ui::menu_bridge::init_bridge(&cc.egui_ctx);
         // Dark theme by default: point colors read best on a dark canvas.
         // Theme switching is out of scope (spec §5 non-goals).
         cc.egui_ctx.set_theme(egui::Theme::Dark);
@@ -179,6 +193,8 @@ impl RoboViewApp {
             error: None,
             add_frame_dialog: AddFrameDialog::new(),
             add_marker_dialog: AddMarkerDialog::new(),
+            #[cfg(target_os = "macos")]
+            native_menu_bridge,
         }
     }
 
@@ -379,6 +395,16 @@ impl RoboViewApp {
 
 impl eframe::App for RoboViewApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Native macOS menu events (004 spike T2): drain the bridge queue
+        // once per frame. This spike only logs — dispatch to real actions
+        // (AppAction) lands in T10.
+        #[cfg(target_os = "macos")]
+        if let Some(bridge) = &mut self.native_menu_bridge {
+            for event in bridge.drain() {
+                tracing::info!(menu_id = %event.id().0, "native menu event (004 spike)");
+            }
+        }
+
         // 1. Renderer lifecycle: create the renderer and the scene pipeline
         // family from eframe's wgpu render state and rebuild them when the
         // surface target format changes.
