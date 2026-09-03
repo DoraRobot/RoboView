@@ -56,3 +56,4 @@
 - T9 `9584454`（23 新键 EN/ZH 齐全、表对齐 UT 通过；显隐拆 Show/Hide 两键随状态切换；getter 暂挂 dead_code allow 待消费）。
 - T11 `d81df7c`（四区骨架：左 180–360/右 200–360/底 26px 全宽/Central 填充；占位面板 id=最终身份；480×360 构图余量验证；theme token 接入零视觉变化；menu_bridge/错误窗/Add 窗/空态门控全保留；T12 接线点+需求清单已备案）。
 - T10 `dfa36ae`（menu.rs 双路径：AppAction 全集（007 兼容预置）+ 稳定 id 字符串键空间 + `egui_menu_bar`/muda `build_native`（Grid/Axes=CheckMenuItem 自勾选同步）+ `relabel`（items 层 LABEL_KEYS 表）+ set_enabled/set_checked；bridge 重构为纯 transport（真树经 `init_bridge_with_menu`，过渡 `init_bridge` 保 main.rs 编译、接线后删）；5 新 UT+28/28 全绿；集成配方①–⑤交协调者）。
+- T12 `c03c523`（objects_panel 升级：分组/折叠/搜索/右键三项/组默认色 chip；`ObjectsPanelState`+`ui()`+`TreeAction`/`apply_actions`；39/39 全绿；interim shim 保旧入口）。**集成接线 `8d634b9`**：ui() 为唯一入口（shim/PanelRequests 删除）、main.rs AppAction 分发（Open 组合对话框=三族筛选保回归）、macOS 隐藏窗口内菜单栏、单飞 set_open_enabled。门禁：clippy 0 警告/39+186 测试/A9 守卫绿。
