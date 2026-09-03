@@ -78,18 +78,47 @@
 //! must stay exclusive; on the UI thread the lock is uncontended. The
 //! meshes and the scene data owned by the state make the whole structure
 //! `Send`, which also future-proofs offloading uploads to a worker thread.
+//!
+//! # Single-object commit service (004 plan §3.5, task T16)
+//!
+//! On top of the load-time uploads the state exposes the per-object commit
+//! service the properties panel edits through (004 spec §4 A3/A4):
+//! [`ViewportState::apply_object_edits`] commits field edits — the common
+//! name/visibility rows plus the kind-owned fields of frames and markers —
+//! re-provisioning the object's GPU handle through the shared upload
+//! dispatch when a field its geometry draws changed. The color rows of
+//! meshes and point clouds commit through the appearance channel instead:
+//! [`ViewportState::appearance_override`] and
+//! [`ViewportState::clear_appearance_override`] set and remove the object's
+//! color override by writing its per-object appearance uniform (the T7
+//! channel) in place — one 64-byte queue write per change, never a
+//! re-upload or a pipeline rebuild (spec §6).
+//!
+//! [`ViewportState::set_selected`] mirrors the objects tree's selection onto
+//! the same channel, toggling the selection flag of at most the two affected
+//! objects per change; a per-frame poll of an unchanged selection costs an
+//! `Option` compare and writes nothing (spec M9/A12). The `id → Appearance`
+//! registry in the state is the app-level CPU bearer of this whole channel
+//! (plan §3.5): an entry exists exactly while the object's override is
+//! active, carries the current selection bit, and is replayed whenever a
+//! fresh upload resets the uniform to its default — renderer rebuilds and
+//! geometry re-uploads both replay right behind the upload they reset. None
+//! of the service ever touches the A6 handle ledger beyond the existing
+//! upload arms and display-type drop notes.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use eframe::egui;
 use egui_wgpu::wgpu;
 use glam::{Mat4, Vec2, Vec3, Vec4, vec2};
 
-use roboview_core::displays::{self, DisplayObject, Marker};
+use roboview_core::displays::{self, DisplayKind, DisplayObject, Marker};
 use roboview_core::io;
 use roboview_core::render;
-use roboview_core::scene::Scene;
+use roboview_core::render::renderer::Appearance;
 use roboview_core::scene::camera::OrbitCamera;
+use roboview_core::scene::{Scene, SceneObject};
 
 use super::camera_input;
 use super::texts::{self, Locale};
@@ -138,6 +167,27 @@ const INDICATOR_ARM_WIDTH: f32 = 3.0;
 /// Distance (points) of an axis letter's center from the disc center.
 const INDICATOR_LETTER_RADIUS: f32 = 21.0;
 
+/// The color a newly created object starts with while its group has no
+/// user-set default (004 spec M4/D4) — a neutral light gray, numerically
+/// identical to the objects panel's own unset marker (`GROUP_COLOR_UNSET`
+/// of ui/objects_panel.rs, the mirror source). The viewport never imports a
+/// sibling panel module (objects_panel already imports this one), so the
+/// two constants stay in lockstep by this comment.
+const GROUP_COLOR_UNSET: io::Color = io::Color {
+    r: 190,
+    g: 190,
+    b: 190,
+};
+
+/// Upload-default albedo of triangle-face meshes — the CPU mirror of
+/// `DEFAULT_MESH_FACE_COLOR` (private in render/mesh.rs): the baked face
+/// color the mesh shader always reads, even without any override flag. The
+/// commit service needs the value to restore a cleared override and to
+/// replay the session appearance after a re-upload without touching core,
+/// so the mirror is pinned here (its sRGB twin lives in
+/// ui/properties_panel.rs; render/mesh.rs's own tests pin the core const).
+const MESH_FACE_DEFAULT_ALBEDO: [f32; 4] = [0.7, 0.75, 0.8, 1.0];
+
 /// Acquire the viewport state lock, recovering from poisoning: a poisoned
 /// mutex still holds the state (the panicking thread unwound before any
 /// invariant broke), so `into_inner` is safe here.
@@ -145,6 +195,48 @@ pub fn lock_state(state: &Arc<Mutex<ViewportState>>) -> MutexGuard<'_, ViewportS
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One field edit of a single scene object (004 plan §3.5, spec §4 A3/A4):
+/// the property panel packs the changed rows of the selected object into a
+/// batch and commits it through [`ViewportState::apply_object_edits`]. The
+/// variant set maps 1:1 onto the editable CPU fields of the closed display
+/// set:
+///
+/// | Display kind           | Editable rows                           |
+/// |------------------------|-----------------------------------------|
+/// | any scene entry        | [`ObjectEdit::Rename`], [`ObjectEdit::Visible`] |
+/// | `Frame`                | [`ObjectEdit::Origin`], [`ObjectEdit::Length`] |
+/// | `Marker::Text`         | [`ObjectEdit::Anchor`], [`ObjectEdit::Text`] |
+/// | `Marker::Arrow`        | [`ObjectEdit::Start`], [`ObjectEdit::End`] |
+/// | `Mesh` / `PointCloud`  | color row only — through the appearance channel ([`ViewportState::appearance_override`]) |
+/// | `Path`                 | name/visibility rows only               |
+///
+/// An edit whose variant does not match the object's kind is a no-op: the
+/// tree's type column is the contract, and the panel never commits rows the
+/// selected kind does not own. Geometry rows (`Origin`, `Length`, `Start`,
+/// `End`) re-upload the object; every other row is CPU-only (text labels
+/// are painted by the overlay, visibility only skips drawing).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObjectEdit {
+    /// Replace the object's display name (the tree's rename row; the same
+    /// trim-and-reject-blank rule the objects panel's inline rename keeps —
+    /// the scene never stores blank names).
+    Rename(String),
+    /// Set the object's visibility flag.
+    Visible(bool),
+    /// Move a frame's shared origin corner (002 spec F3).
+    Origin(Vec3),
+    /// Set a frame's axis length (002 spec F3).
+    Length(f32),
+    /// Move a text marker's anchor (002 spec F4).
+    Anchor(Vec3),
+    /// Replace a text marker's label (002 spec F4).
+    Text(String),
+    /// Move an arrow marker's tail (002 spec F4).
+    Start(Vec3),
+    /// Move an arrow marker's tip (002 spec F4).
+    End(Vec3),
 }
 
 /// Shared state of the 3D viewport: the scene (camera + every display
@@ -168,6 +260,28 @@ pub struct ViewportState {
     /// Line pipeline of the scene family (paths, frames, marker arrows);
     /// same lifetime invariant as [`ViewportState::mesh_pipeline`].
     line_pipeline: Option<render::LinePipeline>,
+    /// Appearance registry of the commit service (004 plan §3.5, task
+    /// T16): the app-level CPU bearer of the per-object appearance channel.
+    /// An entry exists exactly while the object's color override is active;
+    /// its flags always carry the current selection bit — kept in sync by
+    /// [`ViewportState::set_selected`] — so every replay writes the
+    /// override and the highlight as one composite. Rows of removed objects
+    /// are pruned at every mutation entry point (removals can also come
+    /// from outside this file — the scene API is public — so the pruning is
+    /// self-healing, never a hard invariant).
+    appearances: HashMap<u64, Appearance>,
+    /// Last selection the viewport mirrored, if any. The per-frame
+    /// [`ViewportState::set_selected`] poll compares against it first: an
+    /// unchanged selection costs one `Option` compare and writes nothing
+    /// (004 spec M9/A12), while a change lands within the same frame.
+    selected_mirror: Option<u64>,
+    /// Group default colors of the objects tree, mirrored into the viewport
+    /// (004 spec M4/D4: a group's default colors *new* members of that
+    /// kind). The tree's chips are the authoring side; main.rs syncs them
+    /// here through [`ViewportState::set_group_default_color`], and object
+    /// creation reads the result through
+    /// [`ViewportState::appearance_default_for_new`].
+    group_default_colors: HashMap<DisplayKind, io::Color>,
     /// Session switches of the helper layer (spec §6): the ground grid and
     /// the world-origin axes, both on by default. Session state, not egui
     /// memory — every door (menu items, toolbar buttons, HUD corner
@@ -219,6 +333,9 @@ impl ViewportState {
             renderer: None,
             mesh_pipeline: None,
             line_pipeline: None,
+            appearances: HashMap::new(),
+            selected_mirror: None,
+            group_default_colors: HashMap::new(),
             grid_on: true,
             axes_on: true,
             grid_mesh: None,
@@ -244,6 +361,13 @@ impl ViewportState {
     /// and sample count come from `NativeOptions` (Depth24Plus, 1) and are
     /// constant for the app's lifetime, so the target format is the only
     /// rebuild trigger.
+    ///
+    /// A rebuild resets every appearance uniform to its upload default (the
+    /// fresh handles replace the old ones), so the commit service replays
+    /// the session appearance right behind each upload — the registry
+    /// composite, or the selection flag of a selected object without an
+    /// override (plan §3.5: rebuilds and re-uploads must not lose the mesh
+    /// colors or the highlight).
     pub fn sync_renderer(
         &mut self,
         device: &wgpu::Device,
@@ -276,7 +400,10 @@ impl ViewportState {
         // pipelines (and from the same device if eframe ever switches
         // adapters). Hidden objects upload too: visibility only skips
         // drawing, never releases resources. Text markers hold no GPU data
-        // and are skipped by the upload dispatch.
+        // and are skipped by the upload dispatch. Each fresh handle
+        // provisions the upload default appearance, so the session
+        // appearance replays right behind it — the registry is read while
+        // the scene is borrowed mutably, but the two are disjoint fields.
         for object in self.scene.iter_mut() {
             upload_display(
                 &mut renderer,
@@ -284,6 +411,17 @@ impl ViewportState {
                 &line_pipeline,
                 &mut object.object,
             );
+            if let Some(composite) =
+                session_appearance(&self.appearances, self.selected_mirror, object)
+            {
+                write_appearance_uniform(
+                    &renderer,
+                    &mesh_pipeline,
+                    &line_pipeline,
+                    &object.object,
+                    &composite,
+                );
+            }
         }
         // The helper meshes' bind groups reference the old renderer's
         // layout and uniform buffer (`with_capacity` builds them from the
@@ -340,8 +478,10 @@ impl ViewportState {
     /// Add a UI-built coordinate frame (spec §7 F3): upload its three axis
     /// segments through the line pipeline and append the object under a
     /// generated name (`Frame N`). UI adds never move the camera, whatever
-    /// the scene holds.
-    pub fn add_frame(&mut self, origin: Vec3, length: f32) {
+    /// the scene holds. The scene id of the new object is returned — the
+    /// group-default injection of task T17 commits its color by that id
+    /// right after the add.
+    pub fn add_frame(&mut self, origin: Vec3, length: f32) -> u64 {
         let mut frame = displays::Frame::new(origin, length);
         if let Some(line_pipeline) = self.line_pipeline.as_ref() {
             frame.gpu = Some(line_pipeline.upload_frame(origin, length));
@@ -353,14 +493,15 @@ impl ViewportState {
         }
         self.frame_serial += 1;
         let name = texts::default_frame_name(self.frame_serial);
-        self.scene.add(DisplayObject::Frame(frame), name);
+        self.scene.add(DisplayObject::Frame(frame), name)
     }
 
     /// Add a UI-built marker (spec §7 F4): arrows are uploaded through the
     /// line pipeline, text labels hold no GPU data (they are painted by the
     /// overlay pass). Appended under a generated name (`Marker N`); UI
-    /// adds never move the camera.
-    pub fn add_marker(&mut self, mut marker: displays::Marker) {
+    /// adds never move the camera. The scene id of the new object is
+    /// returned, same contract as [`ViewportState::add_frame`].
+    pub fn add_marker(&mut self, mut marker: displays::Marker) -> u64 {
         if let displays::Marker::Arrow(arrow) = &mut marker {
             if let Some(line_pipeline) = self.line_pipeline.as_ref() {
                 arrow.gpu = Some(line_pipeline.upload_arrow(arrow.start, arrow.end));
@@ -372,7 +513,325 @@ impl ViewportState {
         }
         self.marker_serial += 1;
         let name = texts::default_marker_name(self.marker_serial);
-        self.scene.add(DisplayObject::Marker(marker), name);
+        self.scene.add(DisplayObject::Marker(marker), name)
+    }
+
+    // — Single-object commit service (004 spec §4 A3/A4, plan §3.5; T16) —
+
+    /// Set the color override of one object — the mesh/point-cloud color
+    /// row of the properties panel and the group-default injection of new
+    /// members both route here (004 spec §4 A3, plan §3.5).
+    ///
+    /// The override is recorded in the appearance registry (the CPU bearer
+    /// of the mesh color — core's data model stays untouched) and pushed
+    /// into the object's GPU uniform in place: one 64-byte queue write
+    /// through the existing handle, so no geometry is re-uploaded, no
+    /// pipeline rebuilt, and no A6 ledger row moves (the uniform rides
+    /// inside the handle the upload already counted). An object that is
+    /// currently selected keeps its selection flag on top of the override —
+    /// the registry composite is the union of both channels, and replays
+    /// after a re-upload or renderer rebuild write exactly that union.
+    /// Unknown ids are a no-op (the scene never reuses an id, so an object
+    /// that left it can never need an override again).
+    pub fn appearance_override(&mut self, id: u64, color: io::Color) {
+        self.prune_appearance_registry();
+        if self.scene.get(id).is_none() {
+            return;
+        }
+        let mut appearance = Appearance::srgb_override(color);
+        if self.selected_mirror == Some(id) {
+            appearance = appearance.with_selected(true);
+        }
+        if self.appearances.get(&id) == Some(&appearance) {
+            // The identical composite is already registered and was pushed
+            // when it changed — a repeat submission writes nothing.
+            return;
+        }
+        self.appearances.insert(id, appearance);
+        self.push_appearance_uniform(id, &appearance);
+    }
+
+    /// Remove the color override of one object: the registry row is dropped
+    /// and the uniform is restored to the object's upload default (the
+    /// renderer's baked look — per-point colors, or the mesh face default
+    /// albedo) plus the selection flag while the object is selected. Same
+    /// cost and A6 story as [`ViewportState::appearance_override`]. A
+    /// repeat clear without an active override is a no-op.
+    pub fn clear_appearance_override(&mut self, id: u64) {
+        self.prune_appearance_registry();
+        if self.appearances.remove(&id).is_none() {
+            return;
+        }
+        let Some(object) = self.scene.get(id) else {
+            return;
+        };
+        let selected = self.selected_mirror == Some(id);
+        let mut appearance = upload_default_appearance(&object.object);
+        if selected {
+            appearance = appearance.with_selected(true);
+        }
+        self.push_appearance_uniform(id, &appearance);
+    }
+
+    /// The registered appearance composite of one object while its color
+    /// override is active — the properties panel's read for the current
+    /// mesh/point-cloud color row (plan §3.5: this replaces the read-only
+    /// token the panel displayed before the registry existed). The albedo
+    /// is linear light, same as the uniform.
+    pub fn appearance_of(&self, id: u64) -> Option<Appearance> {
+        self.appearances.get(&id).copied()
+    }
+
+    /// Mirror one object as the selected one — the highlight half of the
+    /// commit service (004 spec §6: there is no picking in the viewport,
+    /// the objects tree drives the selection). Sets the selection flag of
+    /// the object's appearance uniform in place, or clears it from the
+    /// previously selected object — at most two 64-byte queue writes per
+    /// change, never a re-upload, never an A6 ledger row.
+    ///
+    /// Call once per frame with the tree's selection: the mirror compare
+    /// makes an unchanged selection a zero-op (spec M9/A12 — a per-frame
+    /// poll costs one `Option` compare and writes nothing), and a *changed*
+    /// selection lands within the same frame, because the writes happen in
+    /// `update`, ahead of the viewport's paint callback. `Some(id)` for an
+    /// object that left the scene normalizes to a deselection — the scene
+    /// never reuses ids — and override rows of removed objects are pruned
+    /// here, so a tree-driven delete needs no registry bookkeeping at its
+    /// call site.
+    pub fn set_selected(&mut self, selected: Option<u64>) {
+        // An id that left the scene cannot be selected: normalize it to a
+        // deselection. The mirror stores only normalized values.
+        let selected = selected.filter(|id| self.scene.get(*id).is_some());
+        if self.selected_mirror == selected {
+            return;
+        }
+        let previous = self.selected_mirror;
+        self.selected_mirror = selected;
+        self.prune_appearance_registry();
+        // Only the two affected objects can differ from their current
+        // uniform state — every other object's flag is already the one it
+        // should keep — so a change writes at most two uniforms.
+        for candidate in [previous, selected] {
+            let Some(id) = candidate else {
+                continue;
+            };
+            let Some(object) = self.scene.get(id) else {
+                continue;
+            };
+            let is_selected = selected == Some(id);
+            let appearance = match self.appearances.get(&id).copied() {
+                Some(entry) => {
+                    let next = entry.with_selected(is_selected);
+                    if next != entry {
+                        // Registry rows always carry the current selection
+                        // bit, so a replay writes the composite exactly as
+                        // stored.
+                        self.appearances.insert(id, next);
+                    }
+                    next
+                }
+                None => {
+                    // No override active: the uniform holds the upload
+                    // default plus the flag of the last mirror. Write the
+                    // flag transition — for a face-carrying mesh this also
+                    // restores its baked albedo when the selection leaves
+                    // it, which is exactly why the entry-less composite is
+                    // the upload default, not an all-zero albedo.
+                    upload_default_appearance(&object.object).with_selected(is_selected)
+                }
+            };
+            self.push_appearance_uniform(id, &appearance);
+        }
+    }
+
+    /// Commit one batch of field edits to a single scene object (004 spec
+    /// §4 A3/A4 — the property panel's commit requests). The effect is
+    /// within one frame: the edits, the possible re-upload, and the paint
+    /// all run on the UI thread of a single update.
+    ///
+    /// CPU fields are updated in place; an edit that changed geometry —
+    /// frame origin/length, arrow start/end — re-provisions the object's
+    /// GPU handle through the shared upload dispatch (a full re-upload:
+    /// frame and marker geometry is tiny, and the spec sanctions the
+    /// retransmit, plan §3.5). Text-marker edits need no re-upload (labels
+    /// hold no GPU data), and name/visibility touch the scene entry only.
+    /// An edit whose variant does not fit the object's kind is a no-op, and
+    /// a vanished id skips the whole batch. The object's appearance
+    /// (override, selection) is untouched by field edits — the registry is
+    /// orthogonal to the CPU fields.
+    pub fn apply_object_edits(&mut self, id: u64, edits: &[ObjectEdit]) {
+        let geometry_dirty = {
+            let Some(object) = self.scene.get_mut(id) else {
+                return;
+            };
+            let mut dirty = false;
+            for edit in edits {
+                match (edit, &mut object.object) {
+                    (ObjectEdit::Rename(name), _) => {
+                        let trimmed = name.trim();
+                        if !trimmed.is_empty() {
+                            // Same rule as the tree's inline rename: blank
+                            // names are rejected, and the input is trimmed.
+                            object.name = trimmed.to_owned();
+                        }
+                    }
+                    (ObjectEdit::Visible(visible), _) => object.visible = *visible,
+                    (ObjectEdit::Origin(origin), DisplayObject::Frame(frame)) => {
+                        if frame.origin != *origin {
+                            frame.origin = *origin;
+                            dirty = true;
+                        }
+                    }
+                    (ObjectEdit::Length(length), DisplayObject::Frame(frame)) => {
+                        if frame.length != *length {
+                            frame.length = *length;
+                            dirty = true;
+                        }
+                    }
+                    (ObjectEdit::Anchor(anchor), DisplayObject::Marker(Marker::Text(text))) => {
+                        if text.anchor != *anchor {
+                            text.anchor = *anchor;
+                        }
+                    }
+                    (ObjectEdit::Text(text), DisplayObject::Marker(Marker::Text(marker))) => {
+                        if marker.text != *text {
+                            marker.text = text.clone();
+                        }
+                    }
+                    (ObjectEdit::Start(start), DisplayObject::Marker(Marker::Arrow(arrow))) => {
+                        if arrow.start != *start {
+                            arrow.start = *start;
+                            dirty = true;
+                        }
+                    }
+                    (ObjectEdit::End(end), DisplayObject::Marker(Marker::Arrow(arrow))) => {
+                        dirty |= arrow.end != *end;
+                        arrow.end = *end;
+                    }
+                    // Anything else is a kind mismatch and no-ops: the tree
+                    // column of the selected kind is the contract.
+                    _ => {}
+                }
+            }
+            dirty
+        };
+        if geometry_dirty {
+            self.reupload_object(id);
+        }
+    }
+
+    /// Set one group default color of the objects tree in the viewport
+    /// (004 spec M4/D4 — the default colors *new* members of that kind).
+    /// The tree's chips are the authoring side (the objects panel state);
+    /// main.rs syncs them here under the same lock that adds objects, so
+    /// creation can read the current value through
+    /// [`ViewportState::appearance_default_for_new`]. No frame cost when
+    /// the tree did not change: inserting the same value is idempotent.
+    pub fn set_group_default_color(&mut self, kind: DisplayKind, color: io::Color) {
+        self.group_default_colors.insert(kind, color);
+    }
+
+    /// The color a newly created object of `kind` starts with: the
+    /// user-set group default, or the shared unset marker
+    /// ([`GROUP_COLOR_UNSET`]) while the group has none. The caller applies
+    /// the color (through [`ViewportState::appearance_override`]) only when
+    /// it differs from the marker — the marker is "no default", and it
+    /// numerically equals the objects panel's own unset marker.
+    pub fn appearance_default_for_new(&self, kind: DisplayKind) -> io::Color {
+        self.group_default_colors
+            .get(&kind)
+            .copied()
+            .unwrap_or(GROUP_COLOR_UNSET)
+    }
+
+    /// Write one appearance composite into the GPU uniform of `id` — an
+    /// in-place 64-byte queue write through the object's existing handle
+    /// (spec §6: an appearance change never rebuilds anything). A no-op
+    /// when the renderer does not exist yet, when the handle is not
+    /// provisioned, or for text markers (they hold no GPU data): the CPU
+    /// session state is already current, and the next renderer build — or
+    /// the next geometry re-upload — replays it.
+    fn push_appearance_uniform(&self, id: u64, appearance: &Appearance) {
+        let (Some(renderer), Some(mesh_pipeline), Some(line_pipeline)) = (
+            self.renderer.as_ref(),
+            self.mesh_pipeline.as_ref(),
+            self.line_pipeline.as_ref(),
+        ) else {
+            return;
+        };
+        let Some(object) = self.scene.get(id) else {
+            return;
+        };
+        write_appearance_uniform(
+            renderer,
+            mesh_pipeline,
+            line_pipeline,
+            &object.object,
+            appearance,
+        );
+    }
+
+    /// Drop the appearance rows of objects that left the scene. Deletions
+    /// flow through the objects panel's actions, which `main.rs` applies
+    /// straight to the scene — outside this file — so the pruning is
+    /// self-healing: every mutation entry point of the commit service
+    /// calls it. The scene never reuses ids, so a stale row could never be
+    /// read again; pruning is memory hygiene and keeps the registry a true
+    /// mirror of the scene.
+    fn prune_appearance_registry(&mut self) {
+        self.appearances
+            .retain(|id, _| self.scene.get(*id).is_some());
+    }
+
+    /// Re-provision the GPU handle of one object from its current CPU
+    /// fields through the shared upload dispatch — the re-upload arm of
+    /// [`ViewportState::apply_object_edits`] (frame and marker-arrow
+    /// geometry is tiny, so a full retransmit is the sanctioned path, plan
+    /// §3.5).
+    ///
+    /// The new handle replaces the object's old one, so the A6 handle
+    /// ledger sees one more created event of the object's kind — every
+    /// upload arm records it — and the old buffers free through wgpu's
+    /// deferred destruction. That is exactly the accounting the renderer
+    /// rebuild of [`ViewportState::sync_renderer`] already runs for every
+    /// object (render/counters.rs module docs: re-uploads count upload
+    /// events against display removals, never against buffer destruction);
+    /// no other ledger row exists anywhere in this service. The appearance
+    /// channel then replays from the session state, because the fresh
+    /// handle provisions the upload default: the registered override
+    /// composite, or the selection flag of a selected object without an
+    /// override.
+    fn reupload_object(&mut self, id: u64) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            // No renderer yet (egui's wgpu render state arrives with the
+            // first frame): the CPU fields were updated above, and the
+            // next renderer build re-uploads every object from them.
+            return;
+        };
+        // Invariant of sync_renderer: the renderer and both family
+        // pipelines are created and rebuilt together, so a present renderer
+        // implies present pipelines.
+        let mesh_pipeline = self
+            .mesh_pipeline
+            .as_mut()
+            .expect("mesh pipeline must exist whenever the renderer does");
+        let line_pipeline = self
+            .line_pipeline
+            .as_mut()
+            .expect("line pipeline must exist whenever the renderer does");
+        {
+            let Some(object) = self.scene.get_mut(id) else {
+                return;
+            };
+            upload_display(renderer, mesh_pipeline, line_pipeline, &mut object.object);
+        }
+        let composite = self
+            .scene
+            .get(id)
+            .and_then(|object| session_appearance(&self.appearances, self.selected_mirror, object));
+        if let Some(composite) = composite {
+            self.push_appearance_uniform(id, &composite);
+        }
     }
 
     // — Helper-layer session switches (004 spec §6, A11) —
@@ -582,6 +1041,106 @@ fn upload_display(
         }
         DisplayObject::Marker(Marker::Arrow(arrow)) => {
             arrow.gpu = Some(line_pipeline.upload_arrow(arrow.start, arrow.end));
+        }
+        DisplayObject::Marker(Marker::Text(_)) => {}
+    }
+}
+
+/// The appearance the commit service must (re-)write for one object in the
+/// current session: the registered override composite when one exists (its
+/// flags always carry the current selection bit, kept in sync by
+/// [`ViewportState::set_selected`]), else the object's upload default plus
+/// the selection flag when the object is selected. `None` when neither
+/// applies — a fresh upload already provisions exactly the default, so
+/// nothing needs writing.
+///
+/// The mirror-less default composite matters for one subtle case: a
+/// face-carrying mesh without an override that is *not* selected must be
+/// written as its baked face default, not as an all-zero albedo — the mesh
+/// shader always reads the albedo, and the flag alone would blacken it.
+fn session_appearance(
+    appearances: &HashMap<u64, Appearance>,
+    selected: Option<u64>,
+    object: &SceneObject<DisplayObject>,
+) -> Option<Appearance> {
+    if let Some(entry) = appearances.get(&object.id).copied() {
+        return Some(entry);
+    }
+    if selected == Some(object.id) {
+        Some(upload_default_appearance(&object.object).with_selected(true))
+    } else {
+        None
+    }
+}
+
+/// The appearance a fresh GPU upload of `display` provisions: what the
+/// uniform holds right after the upload, before any session state replays.
+/// Everything uploads with [`Appearance::DEFAULT`] (albedo 0, no flags —
+/// the point and line shaders gate on the override flag), except
+/// face-carrying triangle meshes, whose shader always reads the albedo:
+/// they provision their baked face color
+/// ([`MESH_FACE_DEFAULT_ALBEDO`]). A face-less mesh uploads as a scatter
+/// (through the point pipeline) and takes the default like any point
+/// geometry.
+fn upload_default_appearance(display: &DisplayObject) -> Appearance {
+    match display {
+        DisplayObject::Mesh(mesh) => match mesh.gpu.as_ref() {
+            Some(render::MeshGpu::Faces(_)) => Appearance::new(MESH_FACE_DEFAULT_ALBEDO, 0),
+            _ => Appearance::DEFAULT,
+        },
+        _ => Appearance::DEFAULT,
+    }
+}
+
+/// Write one appearance composite into the GPU uniform of a display object
+/// — the single in-place write dispatch of the commit service, mirroring
+/// the handle lookup of [`upload_display`]. Each arm is one 64-byte queue
+/// write through the object's existing handle (`set_appearance` of the
+/// owning pipeline); nothing is re-uploaded and no A6 ledger row moves.
+///
+/// Objects without a provisioned handle are skipped — a text marker holds
+/// no GPU data at all, and every other kind gains its handle on the next
+/// renderer build, which replays the session appearance then.
+fn write_appearance_uniform(
+    renderer: &render::Renderer,
+    mesh_pipeline: &render::MeshPipeline,
+    line_pipeline: &render::LinePipeline,
+    display: &DisplayObject,
+    appearance: &Appearance,
+) {
+    match display {
+        DisplayObject::PointCloud(cloud) => {
+            if let Some(mesh) = cloud.mesh.as_deref() {
+                renderer.set_appearance(mesh, appearance);
+            }
+        }
+        DisplayObject::Mesh(mesh) => {
+            // The same split as the paint pass: a face-less mesh file
+            // uploaded as a scatter and owns a point-pipeline mesh.
+            match mesh.gpu.as_ref() {
+                Some(render::MeshGpu::Faces(faces)) => {
+                    mesh_pipeline.set_appearance(faces, appearance);
+                }
+                Some(render::MeshGpu::Scatter(scatter)) => {
+                    renderer.set_appearance(scatter, appearance);
+                }
+                None => {}
+            }
+        }
+        DisplayObject::Path(path) => {
+            if let Some(mesh) = path.gpu.as_deref() {
+                line_pipeline.set_appearance(mesh, appearance);
+            }
+        }
+        DisplayObject::Frame(frame) => {
+            if let Some(mesh) = frame.gpu.as_deref() {
+                line_pipeline.set_appearance(mesh, appearance);
+            }
+        }
+        DisplayObject::Marker(Marker::Arrow(arrow)) => {
+            if let Some(mesh) = arrow.gpu.as_deref() {
+                line_pipeline.set_appearance(mesh, appearance);
+            }
         }
         DisplayObject::Marker(Marker::Text(_)) => {}
     }
@@ -1413,5 +1972,396 @@ mod tests {
         // all-zero matrix has no inverse at all.
         assert_eq!(grid_window(&Mat4::NAN, Vec2::new(1920.0, 1080.0)), None);
         assert_eq!(grid_window(&Mat4::ZERO, Vec2::new(1920.0, 1080.0)), None);
+    }
+
+    // — Single-object commit service (004 plan §3.5, T16): headless tests.
+    //   No renderer exists here, so the GPU-uniform arms are compile-checked
+    //   (and exercised by the integration smoke tests); the CPU session
+    //   state — registry rows, the selection mirror, scene fields — is
+    //   exactly what runs below. The A6 handle ledger is untestable from
+    //   this crate (its counters are `pub(crate)` to roboview-core), so the
+    //   A6 stance is structural: the service only re-uploads through the
+    //   existing upload arms and never counts anything itself.
+
+    use roboview_core::render::renderer::{APPEARANCE_FLAG_OVERRIDE, APPEARANCE_FLAG_SELECTED};
+
+    /// A fresh viewport whose scene holds one object per kind — frame, text
+    /// marker, arrow marker, point cloud, path — in that order; returns the
+    /// state and the ids. No renderer: only the CPU session state exists.
+    fn scene_state() -> (ViewportState, Vec<u64>) {
+        let mut state = ViewportState::new();
+        let frame = state.scene.add(
+            DisplayObject::Frame(displays::Frame::new(Vec3::new(1.0, 2.0, 3.0), 4.0)),
+            "frame",
+        );
+        let text = state.scene.add(
+            DisplayObject::Marker(Marker::text(Vec3::new(5.0, 6.0, 7.0), "label")),
+            "text marker",
+        );
+        let arrow = state.scene.add(
+            DisplayObject::Marker(Marker::arrow(Vec3::ZERO, Vec3::X * 2.0)),
+            "arrow marker",
+        );
+        let cloud = state.scene.add(
+            DisplayObject::PointCloud(displays::PointCloud::from_data(io::PointCloudData {
+                positions: vec![Vec3::ZERO, Vec3::X],
+                colors: None,
+                bounds: Some(io::Aabb {
+                    min: Vec3::ZERO,
+                    max: Vec3::X,
+                }),
+                format: io::Format::Ply,
+            })),
+            "cloud",
+        );
+        let path = state.scene.add(
+            DisplayObject::Path(displays::Path::from_data(io::PathData {
+                points: vec![Vec3::ZERO, Vec3::X],
+                bounds: Some(io::Aabb {
+                    min: Vec3::ZERO,
+                    max: Vec3::X,
+                }),
+            })),
+            "path",
+        );
+        (state, vec![frame, text, arrow, cloud, path])
+    }
+
+    fn frame_of(state: &ViewportState, id: u64) -> &displays::Frame {
+        match &state.scene.get(id).expect("object present").object {
+            DisplayObject::Frame(frame) => frame,
+            other => panic!("expected a frame at id {id}, got {:?}", other.kind()),
+        }
+    }
+
+    fn text_of(state: &ViewportState, id: u64) -> &displays::MarkerText {
+        match &state.scene.get(id).expect("object present").object {
+            DisplayObject::Marker(Marker::Text(text)) => text,
+            other => panic!("expected a text marker at id {id}, got {:?}", other.kind()),
+        }
+    }
+
+    fn arrow_of(state: &ViewportState, id: u64) -> &displays::MarkerArrow {
+        match &state.scene.get(id).expect("object present").object {
+            DisplayObject::Marker(Marker::Arrow(arrow)) => arrow,
+            other => panic!(
+                "expected an arrow marker at id {id}, got {:?}",
+                other.kind()
+            ),
+        }
+    }
+
+    #[test]
+    fn appearance_override_registers_clears_and_is_idempotent() {
+        let (mut state, ids) = scene_state();
+        let frame = ids[0];
+        // No renderer: the call must not panic — the uniform write is a
+        // deferred no-op, and the registry is the state that replays later.
+        let color = io::Color {
+            r: 10,
+            g: 20,
+            b: 30,
+        };
+        state.appearance_override(frame, color);
+        let stored = state.appearance_of(frame).expect("override registered");
+        assert_ne!(
+            stored.flags & APPEARANCE_FLAG_OVERRIDE,
+            0,
+            "the registry row carries the override flag"
+        );
+        assert_eq!(
+            stored.flags & APPEARANCE_FLAG_SELECTED,
+            0,
+            "nothing is selected yet"
+        );
+        assert_eq!(stored.albedo[0], render::Renderer::srgb_to_linear(10));
+        assert_eq!(stored.albedo[1], render::Renderer::srgb_to_linear(20));
+        assert_eq!(stored.albedo[2], render::Renderer::srgb_to_linear(30));
+        assert_eq!(stored.albedo[3], 1.0, "the override is fully opaque");
+        // A repeat submission of the identical color writes nothing new.
+        state.appearance_override(frame, color);
+        assert_eq!(state.appearances.len(), 1, "one row, not a duplicate");
+        // A different color replaces the row in place.
+        state.appearance_override(frame, io::Color { r: 1, g: 2, b: 3 });
+        assert_eq!(state.appearances.len(), 1);
+        assert_eq!(
+            state.appearance_of(frame).expect("row").albedo[0],
+            render::Renderer::srgb_to_linear(1)
+        );
+        // Clear restores the no-override state; a repeat clear is a no-op.
+        state.clear_appearance_override(frame);
+        assert_eq!(state.appearance_of(frame), None);
+        state.clear_appearance_override(frame);
+        assert_eq!(state.appearance_of(frame), None);
+        // Unknown ids are no-ops on both sides.
+        state.appearance_override(999, color);
+        state.clear_appearance_override(999);
+        assert_eq!(state.appearance_of(999), None);
+        assert!(state.appearances.is_empty(), "no row for an unknown id");
+    }
+
+    #[test]
+    fn set_selected_toggles_only_the_affected_flags_and_idles_on_repeats() {
+        let (mut state, ids) = scene_state();
+        let (a, b) = (ids[0], ids[1]);
+        state.appearance_override(a, io::Color { r: 5, g: 6, b: 7 });
+        // Select a: its row gains the selection flag.
+        state.set_selected(Some(a));
+        assert_eq!(state.selected_mirror, Some(a));
+        let entry_a = state.appearance_of(a).expect("row for a");
+        assert_ne!(entry_a.flags & APPEARANCE_FLAG_SELECTED, 0);
+        assert_eq!(state.appearance_of(b), None, "b has no override yet");
+        // Repeat of the same selection: the mirror is equal, zero-op.
+        state.set_selected(Some(a));
+        assert_eq!(state.selected_mirror, Some(a));
+        assert_eq!(state.appearances.len(), 1, "nothing new registered");
+        // Swap the selection to b: a loses the flag while keeping its
+        // override; b — selected without an override — registers no row
+        // (a bare selection lives in the uniform only, not the registry).
+        state.set_selected(Some(b));
+        assert_eq!(state.selected_mirror, Some(b));
+        let entry_a = state.appearance_of(a).expect("row for a kept");
+        assert_eq!(entry_a.flags & APPEARANCE_FLAG_SELECTED, 0, "flag left a");
+        assert_ne!(
+            entry_a.flags & APPEARANCE_FLAG_OVERRIDE,
+            0,
+            "the override on a is kept"
+        );
+        assert_eq!(
+            state.appearance_of(b),
+            None,
+            "a selection without an override registers nothing"
+        );
+        // Deselect: the mirror clears and the rows lose the flag.
+        state.set_selected(None);
+        assert_eq!(state.selected_mirror, None);
+        let entry_a = state.appearance_of(a).expect("row for a kept");
+        assert_eq!(entry_a.flags & APPEARANCE_FLAG_SELECTED, 0);
+        state.set_selected(None);
+        assert_eq!(state.selected_mirror, None, "a repeat deselect idles too");
+    }
+
+    #[test]
+    fn set_selected_normalizes_removed_ids_and_prunes_their_rows() {
+        let (mut state, ids) = scene_state();
+        let frame = ids[0];
+        state.appearance_override(frame, io::Color { r: 1, g: 1, b: 1 });
+        state.set_selected(Some(frame));
+        // The object leaves the scene through the public scene API — the
+        // same path the objects panel's delete action takes, outside this
+        // file. The next selection change must not resurrect its state.
+        state.scene.remove(frame);
+        state.set_selected(Some(frame));
+        assert_eq!(
+            state.selected_mirror, None,
+            "a stale id normalizes to a deselection"
+        );
+        assert_eq!(
+            state.appearance_of(frame),
+            None,
+            "the row of the removed object is pruned"
+        );
+        assert!(state.appearances.is_empty());
+    }
+
+    #[test]
+    fn override_and_clear_preserve_the_selection_flag() {
+        let (mut state, ids) = scene_state();
+        let frame = ids[0];
+        state.set_selected(Some(frame));
+        // An override applied while selected keeps the highlight on top.
+        state.appearance_override(frame, io::Color { r: 9, g: 8, b: 7 });
+        let stored = state.appearance_of(frame).expect("row registered");
+        assert_ne!(stored.flags & APPEARANCE_FLAG_SELECTED, 0);
+        assert_ne!(stored.flags & APPEARANCE_FLAG_OVERRIDE, 0);
+        // Clearing the override keeps the selection mirror untouched.
+        state.clear_appearance_override(frame);
+        assert_eq!(state.appearance_of(frame), None);
+        assert_eq!(state.selected_mirror, Some(frame));
+    }
+
+    #[test]
+    fn apply_object_edits_updates_cpu_fields_kind_by_kind() {
+        let (mut state, ids) = scene_state();
+        let (frame, text, arrow, cloud) = (ids[0], ids[1], ids[2], ids[3]);
+        // Common rows: rename trims and rejects blanks, visibility sticks.
+        state.apply_object_edits(frame, &[ObjectEdit::Rename("  renamed frame  ".into())]);
+        assert_eq!(state.scene.get(frame).expect("frame").name, "renamed frame");
+        state.apply_object_edits(frame, &[ObjectEdit::Visible(false)]);
+        assert!(!state.scene.get(frame).expect("frame").visible);
+        state.apply_object_edits(frame, &[ObjectEdit::Visible(true)]);
+        assert!(state.scene.get(frame).expect("frame").visible);
+        state.apply_object_edits(text, &[ObjectEdit::Rename("T".into())]);
+        assert_eq!(state.scene.get(text).expect("text marker").name, "T");
+        state.apply_object_edits(text, &[ObjectEdit::Rename("   ".into())]);
+        assert_eq!(
+            state.scene.get(text).expect("text marker").name,
+            "T",
+            "a blank rename is a no-op"
+        );
+        // Frame rows: the geometry edits update the CPU fields; without a
+        // renderer the re-upload arm no-ops silently (the next renderer
+        // build re-uploads from these very fields).
+        state.apply_object_edits(
+            frame,
+            &[
+                ObjectEdit::Origin(Vec3::new(9.0, 9.0, 9.0)),
+                ObjectEdit::Length(42.0),
+            ],
+        );
+        assert_eq!(frame_of(&state, frame).origin, Vec3::new(9.0, 9.0, 9.0));
+        assert_eq!(frame_of(&state, frame).length, 42.0);
+        // Text marker rows: CPU-only, no re-upload (labels hold no GPU data).
+        state.apply_object_edits(
+            text,
+            &[
+                ObjectEdit::Anchor(Vec3::X),
+                ObjectEdit::Text("hello".into()),
+            ],
+        );
+        assert_eq!(text_of(&state, text).anchor, Vec3::X);
+        assert_eq!(text_of(&state, text).text, "hello");
+        // Arrow rows.
+        state.apply_object_edits(
+            arrow,
+            &[ObjectEdit::Start(Vec3::ONE), ObjectEdit::End(Vec3::Y * 3.0)],
+        );
+        assert_eq!(arrow_of(&state, arrow).start, Vec3::ONE);
+        assert_eq!(arrow_of(&state, arrow).end, Vec3::Y * 3.0);
+        // Kind mismatches no-op: frame rows on an arrow, an arrow row on a
+        // text marker, geometry rows on a point cloud (whose color row
+        // commits through the appearance channel instead).
+        state.apply_object_edits(
+            arrow,
+            &[ObjectEdit::Origin(Vec3::X), ObjectEdit::Length(1.0)],
+        );
+        assert_eq!(
+            arrow_of(&state, arrow).start,
+            Vec3::ONE,
+            "frame rows do not touch an arrow"
+        );
+        state.apply_object_edits(text, &[ObjectEdit::Start(Vec3::X)]);
+        assert_eq!(
+            text_of(&state, text).anchor,
+            Vec3::X,
+            "an arrow row does not touch a text marker"
+        );
+        state.apply_object_edits(
+            cloud,
+            &[ObjectEdit::Origin(Vec3::X), ObjectEdit::Anchor(Vec3::X)],
+        );
+        assert_eq!(
+            state.scene.get(cloud).expect("cloud").name,
+            "cloud",
+            "mismatched edits leave the object untouched"
+        );
+        // The common rows do apply to point clouds.
+        state.apply_object_edits(cloud, &[ObjectEdit::Rename("cloud v2".into())]);
+        assert_eq!(state.scene.get(cloud).expect("cloud").name, "cloud v2");
+    }
+
+    #[test]
+    fn apply_object_edits_skips_vanished_and_unknown_objects() {
+        let (mut state, ids) = scene_state();
+        let frame = ids[0];
+        let gone = state.scene.add(
+            DisplayObject::Frame(displays::Frame::new(Vec3::ZERO, 1.0)),
+            "soon gone",
+        );
+        state.scene.remove(gone);
+        // A batch for a removed id (and for an id that never existed)
+        // changes nothing and panics nothing.
+        state.apply_object_edits(
+            gone,
+            &[ObjectEdit::Rename("x".into()), ObjectEdit::Length(5.0)],
+        );
+        state.apply_object_edits(999, &[ObjectEdit::Visible(false)]);
+        assert_eq!(frame_of(&state, frame).length, 4.0);
+        assert!(
+            state.scene.get(gone).is_none(),
+            "the removed object is gone"
+        );
+    }
+
+    #[test]
+    fn group_default_colors_are_kind_scoped_and_fall_back_to_the_unset_marker() {
+        let mut state = ViewportState::new();
+        assert_eq!(
+            state.appearance_default_for_new(DisplayKind::Mesh),
+            GROUP_COLOR_UNSET
+        );
+        let orange = io::Color {
+            r: 255,
+            g: 128,
+            b: 0,
+        };
+        state.set_group_default_color(DisplayKind::Mesh, orange);
+        assert_eq!(state.appearance_default_for_new(DisplayKind::Mesh), orange);
+        assert_eq!(
+            state.appearance_default_for_new(DisplayKind::PointCloud),
+            GROUP_COLOR_UNSET,
+            "the kinds are independent"
+        );
+        assert_eq!(
+            state.appearance_default_for_new(DisplayKind::Frame),
+            GROUP_COLOR_UNSET
+        );
+        // The fallback numerically mirrors the objects panel's own unset
+        // marker (ui/objects_panel.rs) — the lockstep is by comment, and
+        // this assertion pins it against the sibling panel module.
+        assert_eq!(
+            GROUP_COLOR_UNSET,
+            crate::ui::objects_panel::GROUP_COLOR_UNSET
+        );
+    }
+
+    #[test]
+    fn upload_default_appearance_is_plain_off_gpu_and_replays_follow_the_session() {
+        let (mut state, ids) = scene_state();
+        // Headless, no handle exists for any object: every reachable shape
+        // uploads with the plain default (the face-mesh branch — a handle
+        // carrying `Faces` — is compile-checked here and exercised by the
+        // integration smoke tests; the albedo mirror at the definition site
+        // is pinned to the core const by its comment).
+        for id in &ids {
+            let object = state.scene.get(*id).expect("object present");
+            assert_eq!(
+                upload_default_appearance(&object.object),
+                Appearance::DEFAULT
+            );
+            // Nothing registered and nothing selected: no replay write.
+            assert_eq!(
+                session_appearance(&state.appearances, state.selected_mirror, object),
+                None,
+                "a fresh upload already provisions the default"
+            );
+        }
+        // Selected without an override: the replay composite is the default
+        // plus the selection flag — the highlight must not blacken a mesh
+        // face, which is why the composite starts from the upload default.
+        let frame = ids[0];
+        state.set_selected(Some(frame));
+        let object = state.scene.get(frame).expect("frame present");
+        let composite = session_appearance(&state.appearances, state.selected_mirror, object)
+            .expect("a selected object replays");
+        assert_ne!(composite.flags & APPEARANCE_FLAG_SELECTED, 0);
+        assert_eq!(composite.flags & APPEARANCE_FLAG_OVERRIDE, 0);
+        assert_eq!(composite.albedo, Appearance::DEFAULT.albedo);
+        // Override registered on top: the registry row wins the replay and
+        // carries the synced selection bit.
+        state.appearance_override(frame, io::Color { r: 1, g: 2, b: 3 });
+        let object = state.scene.get(frame).expect("frame present");
+        let composite = session_appearance(&state.appearances, state.selected_mirror, object)
+            .expect("an overridden object replays");
+        assert_ne!(composite.flags & APPEARANCE_FLAG_OVERRIDE, 0);
+        assert_ne!(composite.flags & APPEARANCE_FLAG_SELECTED, 0);
+        // Deselecting elsewhere drops the flag from the stored row.
+        let text = ids[1];
+        state.set_selected(Some(text));
+        let object = state.scene.get(frame).expect("frame present");
+        let composite = session_appearance(&state.appearances, state.selected_mirror, object)
+            .expect("row kept");
+        assert_ne!(composite.flags & APPEARANCE_FLAG_OVERRIDE, 0);
+        assert_eq!(composite.flags & APPEARANCE_FLAG_SELECTED, 0);
     }
 }
