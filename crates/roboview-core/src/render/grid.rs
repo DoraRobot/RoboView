@@ -139,7 +139,7 @@ impl Default for GridOptions {
 
 /// A ground-grid view: the camera footprint and the [`GridOptions`].
 ///
-/// `center.z` is ignored — the footprint is the `x`, `y` projection, so
+/// `center.y` is expected to be 0 (the plane coordinate pair is `x`, `z`), so
 /// the grid stays put on Z=0 regardless of camera height.
 #[derive(Debug, Clone, Copy)]
 pub struct GridView {
@@ -276,7 +276,10 @@ pub fn grid_strips(view: &GridView) -> Vec<[Vec3; 2]> {
         None
     };
 
-    let center = view.center.truncate();
+    // The plane pair of the Y=0 ground: (x, z) — `center.y` is the plane
+    // normal component and must be 0 (never `truncate()`, which would drop
+    // z and keep the zeroed y).
+    let center = Vec2::new(view.center.x, view.center.z);
     let half = opts.radius as f64;
     let corner = half * std::f64::consts::SQRT_2;
     let levels = build_ladder(minor, opts.major_step, corner);
@@ -441,9 +444,9 @@ fn emit_piece(
         return;
     }
     out.push(if vertical {
-        [Vec3::new(coord, lo, 0.0), Vec3::new(coord, hi, 0.0)]
+        [Vec3::new(coord, 0.0, lo), Vec3::new(coord, 0.0, hi)]
     } else {
-        [Vec3::new(lo, coord, 0.0), Vec3::new(hi, coord, 0.0)]
+        [Vec3::new(lo, 0.0, coord), Vec3::new(hi, 0.0, coord)]
     });
 }
 
@@ -502,15 +505,15 @@ mod tests {
 
     /// Default steps and radius, centered at `(x, y)`.
     fn view(x: f32, y: f32, radius: f32) -> GridView {
-        GridView::new(Vec3::new(x, y, 0.0), opts(radius))
+        GridView::new(Vec3::new(x, 0.0, y), opts(radius))
     }
 
     /// Segments with fixed `x` (lines running along Y), as (x, lo, hi).
     fn verticals(strips: &[[Vec3; 2]]) -> Vec<(f32, f32, f32)> {
         strips
             .iter()
-            .filter(|s| s[0].x.to_bits() == s[1].x.to_bits() && s[0].y < s[1].y)
-            .map(|s| (s[0].x, s[0].y, s[1].y))
+            .filter(|s| s[0].x.to_bits() == s[1].x.to_bits() && s[0].z < s[1].z)
+            .map(|s| (s[0].x, s[0].z, s[1].z))
             .collect()
     }
 
@@ -518,14 +521,14 @@ mod tests {
     fn horizontals(strips: &[[Vec3; 2]]) -> Vec<(f32, f32, f32)> {
         strips
             .iter()
-            .filter(|s| s[0].y.to_bits() == s[1].y.to_bits() && s[0].x < s[1].x)
-            .map(|s| (s[0].x, s[1].x, s[0].y))
+            .filter(|s| s[0].z.to_bits() == s[1].z.to_bits() && s[0].x < s[1].x)
+            .map(|s| (s[0].x, s[1].x, s[0].z))
             .collect()
     }
 
-    /// Sorted distinct fixed coordinates of the vertical lines (NaN-free
-    /// by construction, so `total_cmp` order equals value order and works
-    /// across signs).
+    /// Sorted distinct fixed coordinates of the vertical lines (fixed `x`,
+    /// running along Z on the Y=0 plane; NaN-free by construction, so
+    /// `total_cmp` order equals value order and works across signs).
     fn vertical_x_coords(strips: &[[Vec3; 2]]) -> Vec<f32> {
         let mut xs: Vec<f32> = verticals(strips).into_iter().map(|(x, _, _)| x).collect();
         xs.sort_by(f32::total_cmp);
@@ -533,9 +536,10 @@ mod tests {
         xs
     }
 
-    /// Sorted distinct fixed coordinates of the horizontal lines.
+    /// Sorted distinct fixed coordinates of the horizontal lines (fixed
+    /// `z`, running along X on the Y=0 plane).
     fn horizontal_y_coords(strips: &[[Vec3; 2]]) -> Vec<f32> {
-        let mut ys: Vec<f32> = horizontals(strips).into_iter().map(|(_, _, y)| y).collect();
+        let mut ys: Vec<f32> = horizontals(strips).into_iter().map(|(_, _, z)| z).collect();
         ys.sort_by(f32::total_cmp);
         ys.dedup_by(|a, b| a.to_bits() == b.to_bits());
         ys
@@ -823,16 +827,16 @@ mod tests {
                 let half = radius + 1e-3;
                 for s in &strips {
                     assert!(s[0].is_finite() && s[1].is_finite());
-                    assert_eq!(s[0].z, 0.0);
-                    assert_eq!(s[1].z, 0.0);
+                    assert_eq!(s[0].y, 0.0);
+                    assert_eq!(s[1].y, 0.0);
                     let (a, b) = (s[0], s[1]);
                     if a.x.to_bits() == b.x.to_bits() {
                         assert!((a.x - center[0]).abs() <= half);
-                        assert!((a.y - center[1]).abs() <= half);
-                        assert!((b.y - center[1]).abs() <= half);
-                        assert!(a.y < b.y);
-                    } else if a.y.to_bits() == b.y.to_bits() {
-                        assert!((a.y - center[1]).abs() <= half);
+                        assert!((a.z - center[1]).abs() <= half);
+                        assert!((b.z - center[1]).abs() <= half);
+                        assert!(a.z < b.z);
+                    } else if a.z.to_bits() == b.z.to_bits() {
+                        assert!((a.z - center[1]).abs() <= half);
                         assert!((a.x - center[0]).abs() <= half);
                         assert!((b.x - center[0]).abs() <= half);
                         assert!(a.x < b.x);
@@ -921,7 +925,7 @@ mod tests {
                         s[1].y.to_bits(),
                         s[1].z.to_bits(),
                     ];
-                    assert!(s[0].x != s[1].x || s[0].y != s[1].y);
+                    assert!(s[0].x != s[1].x || s[0].z != s[1].z);
                     assert!(seen.insert(key), "duplicate segment {s:?}");
                 }
                 // The documented per-configuration pre-allocation bound.

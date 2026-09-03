@@ -6,12 +6,12 @@
 
 相关：`spec.md`（Approved）；ADR 004、ADR 006；`docs/specs/001-point-cloud-viewport/`（A11 固定测量协议）、`docs/specs/002-display-types/`（A6 台账/语义色）、`docs/specs/003-i18n-system-fonts/`（texts.rs/字体链/错误机制）；`docs/plans/2026-09-03-ui-feature-roadmap.md`
 
-修订记录：2026-09-03 起草（按 spec 重审落位后的全套约束）；同日经负责人评审通过（Draft → Approved）。
+修订记录：2026-09-03 起草（按 spec 重审落位后的全套约束）；同日经负责人评审通过（Draft → Approved）。同日运行时修正：地平面 Z=0→Y=0（见 spec 修订行）。
 
 ## 1. 概述
 
 本方案确定 HOW：四区固定骨架（左对象树/中视口/右属性/底状态栏+轻量消息条）、
-视口辅助层（Z=0 地面网格+世界原点三轴+方位指示器，均不入场景树）、per-object 外观 uniform 通道
+视口辅助层（Y=0 地面网格+世界原点三轴+方位指示器，均不入场景树）、per-object 外观 uniform 通道
 （004 与 005 共享的核心渲染演进）、相机数学前移（screen_to_ray 族）、语义色板 token 化、
 主菜单双路径（macOS muda 原生 + Win/Linux 窗口内，共享 `AppAction`）、属性面板（002 参数全集
 可编辑，经新增单对象提交服务 ≤1 帧生效）、树上右键三项+搜索+组默认色、添加▾内联（浮动窗口移除）、
@@ -52,7 +52,7 @@ i18n 新键、最小窗口（480×360）复验承检。
 ```text
 pub fn screen_to_ray(view_proj: &Mat4, viewport_size: Vec2, pos: Vec2) -> Option<(Vec3, Vec3)>;  // 两点反投影
 pub fn pointer_world(view_proj: &Mat4, viewport_size: Vec2, pos: Vec2, plane: WorldPlane) -> Option<Vec3>;
-//   WorldPlane = 世界 Z=0 | 相机目标平面（无网格时 M5 坐标口径）
+//   WorldPlane = 世界 Y=0（up +Y）| 相机目标平面（无网格时 M5 坐标口径）
 pub fn orientation_gizmo(view_proj: &Mat4, rect: Rect) -> [(Vec2, bool); 3];
 //   view-proj 线性 3×3 列归一取 .xy + y 翻转；列 xy 符号即朝向（不做 w≤0 取反——T3 实测钉住）；
 //   轴与视线精确平行时该轴不可见（不复用 anchor_to_screen 的 None 语义）
