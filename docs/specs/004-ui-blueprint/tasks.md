@@ -49,3 +49,8 @@
 - T4 `82d688e`（轴色常量 pub + 002 A4 语义锁测试：28 passed；pub 链路全可达，无需导出改动）。
 - T5 `2f6bb9b`（grid.rs 网格生成纯函数：LOD 分级/生成端裁剪/snap 对齐——A11 no-crawl 位级测试钉死；16 UT；`render/mod.rs` 注册随 `3dca778` 后协调提交，workspace 测试通过；`segment_capacity_bound` 供 T6 容量预建）。
 - T3 `6e58dcf`（相机数学三纯函数：screen_to_ray/pointer_world（GroundZ0+CameraTargetPlane）/orientation_gizmo_dirs；19 UT 全绿、core 174 passed、clippy 零警告。**偏差回填**：plan §3.2"w≤0 取反"改为"列 xy 符号即朝向、不取反"——实测推导取反会交换 Y/Z 臂，spec §6/plan 已同步修订并钉住测试）。
+- T6 `65ed8f9`（LinePipeline 容量预建 `with_capacity` + `update_mesh` 就地刷新；32 轮刷新 ptr/capacity 恒等零重分配 UT；grid 扫描证明 capacity bound 覆盖；未触 counters）。
+- T7 `86a3b74`（per-object 外观通道：64B uniform（albedo@0/flags@16/保留@32/48）+ APPEARANCE_FLAG_OVERRIDE/SELECTED、三管线 group(1)、3 WGSL（mesh FACE_COLOR 常量删除→CPU `DEFAULT_MESH_FACE_COLOR` 同值迁移）、`set_appearance` 就地写不触发重建、naga 布局钉死、50 轮外观循环字节确定性；core 186 passed）。
+- T8 `3d70210`（theme.rs 语义色板 token + A9 三断言：SELECT_HIGHLIGHT(255,128,0) 与轴色相差 ≥25°、GRID_LINE(70,70,70) 暗于全部语义色（Z 蓝为约束项）、ORIGIN_AXIS 引用 core 常量恒等锁——3 UT）。
+- T9 `9584454`（23 新键 EN/ZH 齐全、表对齐 UT 通过；显隐拆 Show/Hide 两键随状态切换；getter 暂挂 dead_code allow 待消费）。
+- T11 `d81df7c`（四区骨架：左 180–360/右 200–360/底 26px 全宽/Central 填充；占位面板 id=最终身份；480×360 构图余量验证；theme token 接入零视觉变化；menu_bridge/错误窗/Add 窗/空态门控全保留；T12 接线点+需求清单已备案）。
