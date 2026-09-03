@@ -1734,7 +1734,7 @@ fn paint_label(
 /// geometry guard mirrors the line pipeline's upload guard: frames with
 /// non-finite origins or non-positive lengths draw no geometry and get no
 /// letters either.
-
+///
 /// Overlay letters of the world-origin axis trio (X red / Y green / Z
 /// blue, the 002 semantic colors at the fixed `ORIGIN_AXIS_LENGTH`),
 /// projected per frame like the frame labels — so the default view reads
