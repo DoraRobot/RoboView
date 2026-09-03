@@ -19,24 +19,35 @@
 //!    data, a failure keeps the current objects and shows an error window.
 //! 3. Install pending data once a renderer exists (single-flight; upload
 //!    and scene add happen here, on the UI thread).
-//! 4. Draw the four-region fixed skeleton (spec §6): the top menu bar
-//!    (File → Open point cloud / mesh / path + Language), the bottom
-//!    status-band placeholder (task T15 owns the real status bar), the
-//!    left objects panel (Fit, Add frame / marker, the object list), the
-//!    right properties placeholder (task T14 owns the real panel), and the
-//!    central viewport filling the rest — the central panel always comes
-//!    last. The side regions are width-constrained (left 180–360, right
-//!    200–360) so the 480×360 minimum window keeps a viewport sliver (spec
-//!    A13): egui clamps every panel to the space that remains, and the
-//!    viewport guards degenerate rects (ui/viewport.rs), so squeezing the
-//!    window never panics.
+//! 4. Draw the four-region fixed skeleton (spec §6): the top region —
+//!    on Windows/Linux one panel holds the in-window menu bar and the
+//!    toolbar as two rows; on macOS the same region holds only the
+//!    toolbar, because the menu lives in the native system bar (decision
+//!    D5: the toolbar is a button row, not a menu, so it stays in-window).
+//!    The toolbar is the D3 button set: the Open dropdown (the per-family
+//!    dialogs), Fit, the Add dropdown (frame / marker), and the Grid /
+//!    Axes toggles, whose session state lives in `ViewportState` (T13
+//!    subject) — every door of a toggle (toolbar buttons, HUD badges, menu
+//!    items) funnels through the same `AppAction`. Below the top region:
+//!    the full-width bottom status band — the readouts and the
+//!    lightweight message strip of task T15's `ui/status_bar.rs` (D2: the
+//!    strip and the error window coexist until the 007 message center) —
+//!    the left objects panel (Fit, Add frame / marker, the object list),
+//!    the right properties panel (task T14's `ui/properties_panel.rs`),
+//!    and the central viewport filling the rest — the
+//!    central panel always comes last. The side regions are
+//!    width-constrained (left 180–360, right 200–360) so the 480×360
+//!    minimum window keeps a viewport sliver (spec A13): egui clamps every
+//!    panel to the space that remains, and the viewport guards degenerate
+//!    rects (ui/viewport.rs), so squeezing the window never panics.
 //! 5. Draw the non-modal error window and the two add dialogs on top.
 //!
 //! Loading never blocks the UI thread: the dialog choice spawns a worker
 //! thread that parses the file and reports back over an mpsc channel; the
 //! worker asks egui for a repaint when it finishes.
 //!
-//! The three open entries of the File menu are one channel into the same
+//! The open doors — the menu's single combined "Open…" and the toolbar's
+//! three per-family entries — are one channel into the same
 //! `io::load_object` dispatch, distinguished only by the dialog filter
 //! (spec A12 guard: the dotless extension lists stay here, next to
 //! `OpenKind`, so the repository check script finds them).
@@ -54,6 +65,8 @@ use roboview_core::scene::camera::OrbitCamera;
 
 use ui::menu::AppAction;
 use ui::objects_panel::{self, AddFrameDialog, AddMarkerDialog, ObjectsPanelState};
+use ui::properties_panel;
+use ui::status_bar::{MessageItem, MessageLevel, StatusBar, StatusInfo, TOOL_NAVIGATE};
 use ui::texts;
 use ui::theme;
 use ui::viewport::{self, ViewportState};
@@ -69,8 +82,7 @@ enum OpenKind {
 }
 
 impl OpenKind {
-    /// The File menu label of this family.
-    #[allow(dead_code)] // T20 toolbar Open▾ re-enables per-family labels
+    /// The per-family label of the toolbar Open dropdown entries (T20).
     fn menu_label(self, locale: texts::Locale) -> &'static str {
         match self {
             OpenKind::PointCloud => texts::menu_open_point_cloud(locale),
@@ -105,6 +117,21 @@ impl OpenKind {
             ),
         }
     }
+}
+
+/// One click of the toolbar row, queued while the row is drawn: the row's
+/// closures borrow only the queue and this frame's snapshots, while the
+/// handlers need `&mut self` — so the queue is drained after the row
+/// returns.
+#[derive(Debug, Clone, Copy)]
+enum ToolbarEvent {
+    /// The Open dropdown → the native dialog of one file family (the menu
+    /// keeps its single combined door, [`RoboViewApp::open_any_dialog`]).
+    OpenFamily(OpenKind),
+    /// Fit / the Add dropdown / the Grid and Axes toggles → an action of
+    /// the shared vocabulary, through the single dispatch point
+    /// ([`RoboViewApp::dispatch_action`]).
+    Action(AppAction),
 }
 
 /// Result of one background load, sent over the loader channel.
@@ -177,6 +204,15 @@ struct RoboViewApp {
     /// Tree-side state of the objects panel (search filter, group
     /// collapse/colors, selection label) — 004 app-owned subject (T12).
     objects_state: ObjectsPanelState,
+    /// Status bar of the bottom band (004 T15): owns the frame-time
+    /// samples of the FPS readout across frames ([`StatusBar::record`]
+    /// once per `update`).
+    status_bar: StatusBar,
+    /// Session message log of the bottom strip (004 spec D2), oldest
+    /// first: every recorded load failure lands here as an error item, and
+    /// the non-modal error window keeps showing the event until dismissed
+    /// — the two coexist until the 007 message center replaces the window.
+    messages: Vec<MessageItem>,
 }
 
 impl RoboViewApp {
@@ -215,6 +251,8 @@ impl RoboViewApp {
             add_frame_dialog: AddFrameDialog::new(),
             add_marker_dialog: AddMarkerDialog::new(),
             objects_state: ObjectsPanelState::default(),
+            status_bar: StatusBar::new(),
+            messages: Vec::new(),
             #[cfg(target_os = "macos")]
             native_menu_bridge,
         }
@@ -222,9 +260,8 @@ impl RoboViewApp {
 
     /// Open the native file dialog for one file family and start a
     /// background load of the chosen file. Blocking by design (rfd's
-    /// modal dialog); the menu disables itself while a load is in flight,
-    /// so at most one worker exists at a time.
-    #[allow(dead_code)] // T20 toolbar Open▾ re-enables per-family dialogs
+    /// modal dialog); the toolbar's Open dropdown entries are disabled
+    /// while a load is in flight, so at most one worker exists at a time.
     fn open_file_dialog(&mut self, ctx: &egui::Context, kind: OpenKind) {
         let (title, filter, extensions) = kind.dialog_spec(self.locale);
         let Some(path) = rfd::FileDialog::new()
@@ -271,9 +308,9 @@ impl RoboViewApp {
         self.start_background_load(ctx, path, kind);
     }
 
-    /// Dispatch one menu action of the dual path (004 T10): the macOS
-    /// native tree and the Win/Linux in-window bar both funnel here, so
-    /// every menu door behaves identically.
+    /// Dispatch one action of the shared vocabulary (004 T10/T20): the
+    /// macOS native tree, the Win/Linux in-window bar, and the toolbar all
+    /// funnel here, so every door behaves identically.
     fn dispatch_action(&mut self, ctx: &egui::Context, action: AppAction) {
         match action {
             AppAction::Open => self.open_any_dialog(ctx),
@@ -292,17 +329,56 @@ impl RoboViewApp {
                     bridge.relabel(locale);
                 }
             }
-            // Auxiliary toggles: the state lives in the viewport layer
-            // (T13 wires the HUD/toolbar double doors to the same subject).
-            AppAction::ToggleGrid | AppAction::ToggleAxes => {
-                tracing::info!(?action, "auxiliary toggle (wired with T13)");
+            // Helper-layer toggles of the D3 button set: the grid/axes
+            // session state lives in the viewport layer (T13 subject) and
+            // is the single source for every door — the menu items, the
+            // toolbar buttons, and the HUD badges (spec §6 double doors) —
+            // so the toggle happens here, once, and the native macOS check
+            // marks follow the state.
+            AppAction::ToggleGrid => {
+                viewport::lock_state(&self.viewport).toggle_grid();
+                self.reconcile_native_toggles();
             }
-            // Toolbar-owned (Fit, T20), native-terminated (Quit never emits
-            // a MenuEvent), or without a door yet.
-            AppAction::Fit | AppAction::ResetView | AppAction::Quit => {
+            AppAction::ToggleAxes => {
+                viewport::lock_state(&self.viewport).toggle_axes();
+                self.reconcile_native_toggles();
+            }
+            // The Fit door is toolbar-owned (no menu node produces it,
+            // ui/menu.rs — the action exists so the toolbar maps into this
+            // vocabulary unchanged): reframe the camera on the scene.
+            AppAction::Fit => self.fit_scene(),
+            // Native-terminated (Quit never emits a MenuEvent) or without a
+            // door yet.
+            AppAction::ResetView | AppAction::Quit => {
                 tracing::debug!(?action, "menu action without a handler yet");
             }
         }
+    }
+
+    /// Mirror the authoritative helper-layer state into the native macOS
+    /// menu check items after a toggle through a non-menu door. muda's
+    /// check items auto-toggle only for their own clicks (ui/menu.rs); the
+    /// toolbar and HUD doors of the same toggles reconcile here so the
+    /// native marks cannot drift. No-op on platforms without the native
+    /// menu.
+    fn reconcile_native_toggles(&self) {
+        #[cfg(target_os = "macos")]
+        if let Some(bridge) = &self.native_menu_bridge {
+            let state = viewport::lock_state(&self.viewport);
+            bridge.set_grid_checked(state.grid_on());
+            bridge.set_axes_checked(state.axes_on());
+        }
+    }
+
+    /// Reframe the camera on the union of the measurable scene bounds —
+    /// the framing the first object of an empty scene receives
+    /// (display-types spec §6). One path for the toolbar's Fit door
+    /// ([`AppAction::Fit`]) and the objects panel's Fit button; the doors
+    /// disable themselves while nothing measurable exists (frames and
+    /// markers never join the bounds union).
+    fn fit_scene(&mut self) {
+        let mut state = viewport::lock_state(&self.viewport);
+        state.scene.camera = OrbitCamera::framing(state.scene.bounds_union().as_ref());
     }
 
     /// Reflect the single-flight load state into the native menu's Open
@@ -354,8 +430,25 @@ impl RoboViewApp {
             }
             Err(error) => {
                 tracing::warn!(%error, "could not start the background loader");
+                self.record_message(MessageItem::new(
+                    MessageLevel::Error,
+                    texts::loader_start_failed(self.locale, &error),
+                ));
                 self.error = Some(ErrorEvent::StartFailed(error));
             }
+        }
+    }
+
+    /// Append one error/warning to the bottom-strip log (004 spec D2),
+    /// newest last. The log stays bounded: the strip shows only the most
+    /// recent `MAX_VISIBLE_MESSAGES` entries, and older items beyond the
+    /// session cap below drop out first.
+    fn record_message(&mut self, item: MessageItem) {
+        self.messages.push(item);
+        const SESSION_CAP: usize = 16;
+        if self.messages.len() > SESSION_CAP {
+            let overflow = self.messages.len() - SESSION_CAP;
+            self.messages.drain(..overflow);
         }
     }
 
@@ -374,12 +467,21 @@ impl RoboViewApp {
                 self.pending_object = Some(PendingObject { name, object });
             }
             Ok(LoadOutcome::Failed { file, error }) => {
+                // D2: the strip carries the failure alongside the window.
+                self.record_message(MessageItem::new(
+                    MessageLevel::Error,
+                    texts::load_failed(self.locale, &file, &error),
+                ));
                 self.load = None;
                 self.set_open_enabled(true);
                 self.error = Some(ErrorEvent::Failed { file, error });
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
+                self.record_message(MessageItem::new(
+                    MessageLevel::Error,
+                    texts::loader_aborted(self.locale),
+                ));
                 self.load = None;
                 self.set_open_enabled(true);
                 self.error = Some(ErrorEvent::Aborted);
@@ -414,26 +516,147 @@ impl RoboViewApp {
         }
     }
 
-    /// The top menu bar. The open entries are disabled while a background
-    /// load runs (single-flight loading).
-    /// The window menu bar (Windows/Linux only — macOS renders the native
-    /// global bar per D5, and the top panel that hosts this method is gated
-    /// out on that platform). One door: the dual-path menu module, every
-    /// click funnels into [`Self::dispatch_action`].
+    /// The in-window menu bar row (Windows/Linux only — macOS renders the
+    /// native global bar per D5, so this row never draws there). One door
+    /// of the dual-path menu module: every click funnels into
+    /// [`Self::dispatch_action`], and the Open action is filtered here
+    /// while a background load runs (single-flight loading; the native
+    /// menu disables its item through the bridge instead).
     #[cfg(not(target_os = "macos"))]
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let loading = self.load.is_some();
         let mut actions = Vec::new();
         ui::menu::egui_menu_bar(ui, self.locale, &mut actions);
         for action in actions {
-            // Single-flight: the Open action is inert while a load runs (the
-            // native menu disables its item through the bridge; the
-            // in-window bar filters right here).
+            // Single-flight: the Open action is inert while a load runs.
             if matches!(action, AppAction::Open) && loading {
                 continue;
             }
             self.dispatch_action(ui.ctx(), action);
         }
+    }
+
+    /// The toolbar row of the four-region skeleton (004 spec §6, D3
+    /// button set): the Open dropdown with the three per-family dialogs,
+    /// Fit, the Add dropdown (frame / marker — the dialogs stay until T17
+    /// replaces them with inline forms), and the Grid / Axes toggles.
+    ///
+    /// Clicks are queued while the row is drawn and applied when the row
+    /// returns — the closures borrow only the queue and this frame's
+    /// snapshots, the handlers need `&mut self`. The Open entries are
+    /// disabled while a background load runs (single-flight loading, like
+    /// the menu's Open door).
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let locale = self.locale;
+        let loading = self.load.is_some();
+        // Snapshot the frame's session subjects for the row: the grid and
+        // axes states live in the viewport layer (T13 subject) and are
+        // painted here from their getters; Fit is enabled only when
+        // something measurable exists (the same bounds-union read the
+        // objects panel's Fit button uses).
+        let (grid_on, axes_on, can_fit) = {
+            let state = viewport::lock_state(&self.viewport);
+            (
+                state.grid_on(),
+                state.axes_on(),
+                state.scene.bounds_union().is_some(),
+            )
+        };
+        let mut events: Vec<ToolbarEvent> = Vec::new();
+
+        ui.horizontal(|ui| {
+            // Open ▾ — one entry per file family, each opening its own
+            // dialog (the menu keeps the single combined door).
+            ui.menu_button(texts::tool_open(locale), |ui| {
+                for kind in [OpenKind::PointCloud, OpenKind::Mesh, OpenKind::Path] {
+                    if ui
+                        .add_enabled(!loading, egui::Button::new(kind.menu_label(locale)))
+                        .clicked()
+                    {
+                        events.push(ToolbarEvent::OpenFamily(kind));
+                        ui.close();
+                    }
+                }
+            });
+
+            // Fit — reframes the camera on the measurable scene bounds.
+            if ui
+                .add_enabled(can_fit, egui::Button::new(texts::objects_fit(locale)))
+                .on_hover_text(if can_fit {
+                    texts::objects_fit_tooltip(locale)
+                } else {
+                    texts::objects_fit_tooltip_disabled(locale)
+                })
+                .clicked()
+            {
+                events.push(ToolbarEvent::Action(AppAction::Fit));
+            }
+
+            // Add ▾ — the two create doors of the shared vocabulary.
+            ui.menu_button(texts::tool_add(locale), |ui| {
+                if ui.button(texts::objects_add_frame(locale)).clicked() {
+                    events.push(ToolbarEvent::Action(AppAction::AddFrame));
+                    ui.close();
+                }
+                if ui.button(texts::objects_add_marker(locale)).clicked() {
+                    events.push(ToolbarEvent::Action(AppAction::AddMarker));
+                    ui.close();
+                }
+            });
+
+            // Grid / Axes — stateful doors over the helper-layer session
+            // state; they dispatch the same actions the menu items fire.
+            let grid = ui
+                .selectable_label(grid_on, texts::toggle_grid(locale))
+                .on_hover_text(texts::grid_toggle_tooltip(locale));
+            if grid.clicked() {
+                events.push(ToolbarEvent::Action(AppAction::ToggleGrid));
+            }
+            let axes = ui
+                .selectable_label(axes_on, texts::toggle_axes(locale))
+                .on_hover_text(texts::axes_toggle_tooltip(locale));
+            if axes.clicked() {
+                events.push(ToolbarEvent::Action(AppAction::ToggleAxes));
+            }
+        });
+
+        for event in events {
+            match event {
+                ToolbarEvent::OpenFamily(kind) => {
+                    // Defensive single-flight gate (the entries are
+                    // disabled too): never start a second load while one
+                    // runs.
+                    if !loading {
+                        self.open_file_dialog(ui.ctx(), kind);
+                    }
+                }
+                ToolbarEvent::Action(action) => self.dispatch_action(ui.ctx(), action),
+            }
+        }
+    }
+
+    /// The top region of the four-region skeleton (004 spec §6): the
+    /// menu bar row with the toolbar row underneath, sharing one panel.
+    #[cfg(not(target_os = "macos"))]
+    fn top_region(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top(egui::Id::new("menu_bar")).show(ctx, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                self.menu_bar(ui);
+            });
+            // Second row of the same panel: the toolbar below the menu.
+            ui.add_space(4.0);
+            self.toolbar(ui);
+        });
+    }
+
+    /// The top region on macOS: the toolbar only. The menu lives in the
+    /// native system bar (D5), and the toolbar is a button row, not a
+    /// menu — so unlike the in-window menu it stays visible.
+    #[cfg(target_os = "macos")]
+    fn top_region(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top(egui::Id::new("toolbar")).show(ctx, |ui| {
+            self.toolbar(ui);
+        });
     }
 
     /// The left objects panel: Fit, Add frame/marker entries, and the
@@ -466,12 +689,7 @@ impl RoboViewApp {
             );
         }
         if output.fit {
-            viewport::lock_state(&self.viewport).scene.camera = OrbitCamera::framing(
-                viewport::lock_state(&self.viewport)
-                    .scene
-                    .bounds_union()
-                    .as_ref(),
-            );
+            self.fit_scene();
         }
         if output.open_add_frame {
             let (center, scale) = viewport::lock_state(&self.viewport).ui_defaults();
@@ -483,44 +701,52 @@ impl RoboViewApp {
         }
     }
 
-    /// The right properties region — a shell of the four-region skeleton
-    /// (004 spec §6). Task T14 (A8, `properties_panel.rs`) replaces this
-    /// placeholder with the grouped property cards; this round only
-    /// reserves the region and its width constraint so the 480×360 minimum
-    /// window composition (A13) already matches the final layout.
-    ///
-    /// Deliberately empty: no copy is shown until the real panel lands
-    /// (all user-facing copy lives in `texts.rs`, which has no properties
-    /// keys yet — T14 adds the ones it needs).
-    fn properties_placeholder(&mut self, ctx: &egui::Context) {
+    /// The right properties region of the four-region skeleton (004 spec
+    /// §6). Task T14's `ui/properties_panel.rs` renders the grouped
+    /// read-only property cards of the selected object (the selection
+    /// label comes from the objects panel state, T12); the region stays
+    /// width-constrained (200–360) so the 480×360 minimum window keeps a
+    /// viewport sliver (spec A13).
+    fn properties_panel(&mut self, ctx: &egui::Context) {
         let frame = region_frame(&ctx.style());
         egui::SidePanel::right(egui::Id::new("properties_panel"))
             .resizable(true)
             .default_width(220.0)
             .width_range(200.0..=360.0)
             .frame(frame)
-            .show(ctx, |_ui| {
-                // T14 draws the property cards here. The id above is the
-                // panel's final identity, so the width a user chose
-                // survives the placeholder → properties_panel swap.
+            .show(ctx, |ui| {
+                let lock = viewport::lock_state(&self.viewport);
+                let _output =
+                    properties_panel::ui(ui, self.objects_state.selected, &lock.scene, self.locale);
             });
     }
 
-    /// The bottom status region — a shell of the four-region skeleton (004
-    /// spec §6). Task T15 (A9, `status_bar.rs`) replaces this strip with
-    /// the status bar + lightweight message area; this round only reserves
-    /// a fixed-height band (drawn before the side panels, so it spans the
-    /// full window width) for the final composition. Deliberately empty:
-    /// no copy until the real bar lands (all copy lives in `texts.rs`).
-    fn status_bar_placeholder(&mut self, ctx: &egui::Context) {
+    /// The bottom status region of the four-region skeleton (004 spec
+    /// §6): task T15's `ui/status_bar.rs` draws the fixed 26 px band — the
+    /// load-state / tool / pointer-coordinate / FPS readouts (spec A7) and
+    /// the lightweight message strip (D2). The strip is fed from the
+    /// session log [`Self::record_message`] fills on every load failure.
+    /// The pointer-world readout is the last wiring point: it needs the
+    /// viewport-layer intersection of the T13 grid/axes wiring, so until
+    /// T13 reports it the segment shows its dimmed placeholders.
+    fn status_bar_panel(&mut self, ctx: &egui::Context) {
         let frame = region_frame(&ctx.style());
+        let info = StatusInfo {
+            loading: self.load.is_some(),
+            // T13 wiring point: the pointer-world intersection computed by
+            // the viewport layer from its per-frame rect (reference plane:
+            // Z=0 while the grid is shown, the camera-target plane while
+            // hidden — `roboview_core::render::camera_math::pointer_world`).
+            pointer_world: None,
+            tool: TOOL_NAVIGATE,
+            messages: &self.messages,
+        };
         egui::TopBottomPanel::bottom(egui::Id::new("status_bar"))
             .resizable(false)
             .exact_height(26.0)
             .frame(frame)
-            .show(ctx, |_ui| {
-                // T15 draws loading / FPS / pointer-world-coordinate /
-                // tool-hint readouts here, below the side panels.
+            .show(ctx, |ui| {
+                self.status_bar.ui(ui, self.locale, &info);
             });
     }
 
@@ -585,22 +811,22 @@ impl eframe::App for RoboViewApp {
         self.poll_background_load();
         self.install_pending_object();
 
-        // 4. Four-region fixed skeleton (004 spec §6): the top menu bar,
-        // the full-width bottom status-band placeholder (T15), the left
-        // objects panel, the right properties placeholder (T14), and the
-        // central viewport last — it fills whatever the regions leave.
-        // The in-window menu bar exists only where there is no native bar
-        // (D5): macOS hosts the menu in the system menu bar instead.
-        #[cfg(not(target_os = "macos"))]
-        egui::TopBottomPanel::top(egui::Id::new("menu_bar")).show(ctx, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                self.menu_bar(ui);
-            });
-        });
-
-        self.status_bar_placeholder(ctx);
+        // 4. Four-region fixed skeleton (004 spec §6): the status bar of
+        // the bottom band records this frame's duration first (its FPS
+        // readout is a window over recent frames), then the top region
+        // (menu bar + toolbar on Windows/Linux, the toolbar alone on macOS
+        // — the native system bar hosts the menu there, D5), the full-width
+        // bottom status band (T15), the left objects panel, the right
+        // properties panel (T14), and the central viewport last — it fills
+        // whatever the regions leave.
+        self.status_bar
+            .record(std::time::Duration::from_secs_f64(f64::from(
+                ctx.input(|i| i.unstable_dt),
+            )));
+        self.top_region(ctx);
+        self.status_bar_panel(ctx);
         self.objects_panel(ctx);
-        self.properties_placeholder(ctx);
+        self.properties_panel(ctx);
 
         let viewport_state = Arc::clone(&self.viewport);
         let loading = self.load.is_some();
