@@ -81,10 +81,9 @@ pub fn anchor_to_screen(view_proj: &Mat4, viewport_size: Vec2, anchor: Vec3) -> 
 /// [`pointer_world`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorldPlane {
-    /// The world plane `y = 0` — the plane the viewport grid overlay is
-    /// drawn on (004 spec M5: the grid sits on the world Y=0 plane; world
-    /// up is +Y, matching the orbit camera convention).
-    GroundY0,
+    /// The world plane `z = 0` — the plane the viewport grid overlay is
+    /// drawn on (004 spec M5: the grid sits on the world Z=0 plane).
+    GroundZ0,
     /// The camera's target plane: the plane through the orbit target,
     /// perpendicular to the view direction — the coordinate basis the app
     /// reports against while the grid is hidden (spec M5, "无网格时").
@@ -186,14 +185,13 @@ pub fn pointer_world(
 ) -> Option<Vec3> {
     let (origin, dir) = screen_to_ray(view_proj, viewport_size, pos)?;
     let t = match plane {
-        WorldPlane::GroundY0 => {
-            // Plane y = 0, normal (0, 1, 0) — world up is +Y: origin.y +
-            // t·dir.y = 0. The zero-denominator case is a ray parallel to
-            // the plane.
-            if dir.y == 0.0 {
+        WorldPlane::GroundZ0 => {
+            // Plane z = 0, normal (0, 0, 1): origin.z + t·dir.z = 0. The
+            // zero-denominator case is a ray parallel to the plane.
+            if dir.z == 0.0 {
                 return None;
             }
-            -origin.y / dir.y
+            -origin.z / dir.z
         }
         WorldPlane::CameraTargetPlane => {
             // Plane through the world origin, normal = the view direction
@@ -334,10 +332,23 @@ mod tests {
     /// a default pose; `orbit` then levels the pitch.
     fn level_camera(distance: f32) -> OrbitCamera {
         let mut camera = OrbitCamera::new(Vec3::ZERO);
-        // pitch default is 0.6 rad; orbit to exactly 0 to get a level view.
-        camera.orbit(0.0, -0.6);
+        // pitch default is 0.6 rad; orbit down to 0.35: the eye stays above
+        // the Z=0 ground plane (a truly level Z-up camera would lie IN the
+        // plane and see it edge-on).
+        camera.orbit(0.0, -0.25);
         // The default eye-to-target distance is 10: zoom(delta) multiplies
         // the distance by 2^−delta, so delta = log2(10/distance) sets it.
+        camera.zoom((10.0 / distance).log2());
+        camera
+    }
+
+    /// A genuinely level Z-up camera (elevation exactly 0.6 − 0.6 — the
+    /// same f32 constant subtracted back, so the result is bit-exact zero):
+    /// the eye lies in the Z=0 plane — fine for axis-direction tests, useless
+    /// for plane hits.
+    fn level_axes_camera(distance: f32) -> OrbitCamera {
+        let mut camera = OrbitCamera::new(Vec3::ZERO);
+        camera.orbit(0.0, -0.6);
         camera.zoom((10.0 / distance).log2());
         camera
     }
@@ -372,14 +383,14 @@ mod tests {
             "+X stays on the horizontal centerline"
         );
 
-        let up = anchor_to_screen(&view_proj, SIZE, Vec3::Y).unwrap();
+        let up = anchor_to_screen(&view_proj, SIZE, Vec3::Z).unwrap();
         assert!(
             up.y < center.y - 20.0,
-            "world +Y (screen up) must sit above center"
+            "world +Z (screen up, Z-up convention) must sit above center"
         );
         assert!(
             (up.x - center.x).abs() < 1e-2,
-            "+Y stays on the vertical centerline"
+            "+Z stays on the vertical centerline"
         );
     }
 
@@ -387,7 +398,7 @@ mod tests {
     fn anchors_at_or_behind_the_eye_project_to_none() {
         let camera = level_camera(10.0);
         let view_proj = camera.view_proj(SIZE.x / SIZE.y);
-        let eye = Vec3::new(0.0, 0.0, 10.0); // level camera at +Z looks at the origin
+        let eye = Vec3::new(0.0, -9.3926, 3.4254); // pitch 0.35: eye above the Z=0 ground
 
         // Exactly at the eye: w = 0, division is undefined → None.
         assert_eq!(anchor_to_screen(&view_proj, SIZE, eye), None);
@@ -409,13 +420,14 @@ mod tests {
         let camera = level_camera(10.0);
         let view_proj = camera.view_proj(SIZE.x / SIZE.y);
 
-        // Far to the side of a 60°-fov level camera at distance 10: the
-        // frustum half-width at the target plane is tan(30°)·10 ≈ 5.77.
+        // Far to the side of the tilted camera at distance 10: the frustum
+        // half-width at the target plane is tan(30°)·10 ≈ 5.77.
         assert_eq!(anchor_to_screen(&view_proj, SIZE, Vec3::X * 100.0), None);
-        assert_eq!(anchor_to_screen(&view_proj, SIZE, Vec3::Y * 100.0), None);
+        // Far upward (world up axis, off-frustum laterally).
+        assert_eq!(anchor_to_screen(&view_proj, SIZE, Vec3::Z * 100.0), None);
 
-        // Deep behind the target: beyond the far plane (depth > 1) → None.
-        assert_eq!(anchor_to_screen(&view_proj, SIZE, -Vec3::Z * 1.0e5), None);
+        // Deep beyond the target: beyond the far plane (depth > 1) → None.
+        assert_eq!(anchor_to_screen(&view_proj, SIZE, Vec3::Y * 1.0e5), None);
 
         // A point just inside the viewport still projects (frustum edge
         // sanity): world X at the exact half-width maps to ndc x = 1.
@@ -502,7 +514,7 @@ mod tests {
     /// orbit far plane (orbit yaw angles never land exactly on π/2 or π in
     /// f32, which would leave a microscopic tilt in the pose).
     fn hand_view_proj(eye: Vec3, target: Vec3, near: f32, far: f32) -> Mat4 {
-        let view = glam::camera::rh::view::look_at_mat4(eye, target, Vec3::Y);
+        let view = glam::camera::rh::view::look_at_mat4(eye, target, Vec3::Z);
         let proj =
             glam::camera::rh::proj::directx::perspective(FRAC_PI_3, SIZE.x / SIZE.y, near, far);
         proj * view
@@ -520,16 +532,17 @@ mod tests {
         let camera = level_camera(10.0);
         let view_proj = camera.view_proj(SIZE.x / SIZE.y);
 
-        // Level camera at (0, 0, 10) looking at the origin: the center ray
-        // runs along the view axis, from the near plane (0.1 in front of
-        // the eye) toward the far plane (1000 out — camera.rs formulas).
+        // Tilted Z-up camera at (0, −9.3926, 3.4254) looking at the origin:
+        // the center ray runs along the view axis, from the near plane (0.1
+        // in front of the eye) toward the far plane (1000 out — camera.rs
+        // formulas).
         let (near, dir) = screen_to_ray(&view_proj, SIZE, SIZE * 0.5).unwrap();
         assert!(
-            near.abs_diff_eq(Vec3::new(0.0, 0.0, 9.9), 1e-3),
+            near.abs_diff_eq(Vec3::new(0.0, -9.2998, 3.3947), 1e-3),
             "near point must sit on the near plane, got {near:?}"
         );
         assert!(
-            dir.abs_diff_eq(Vec3::new(0.0, 0.0, -1.0), 1e-4),
+            dir.abs_diff_eq(Vec3::new(0.0, 0.939373, -0.342897), 1e-4),
             "center ray must point at the origin, got {dir:?}"
         );
         // Near/far normalization sanity: re-projecting the near point must
@@ -569,7 +582,7 @@ mod tests {
                 (dir.length() - 1.0).abs() < 1e-4,
                 "dir must be unit at {pos:?}, got {dir:?}"
             );
-            assert!(dir.z < 0.0, "level-camera rays point forward, got {dir:?}");
+            assert!(dir.y > 0.0, "tilted-camera rays point forward, got {dir:?}");
             // The whole ray re-projects to its own pixel: check a point
             // mid-frustum (depth ~500) rather than the near/far endpoints,
             // which sit exactly on the depth-cull boundaries.
@@ -633,15 +646,15 @@ mod tests {
 
     #[test]
     fn center_pixel_hits_the_origin_on_both_reference_planes() {
-        // The default orbit pose sits above the ground (pitch 0.6, eye
-        // y > 0), so the center ray hits the origin on both reference
-        // planes: the ground crossing (y = 0) is exactly the origin at the
-        // eye-to-target distance, and the camera-target plane passes
-        // through the origin perpendicular to the view direction.
-        let camera = OrbitCamera::new(Vec3::ZERO);
+        let camera = level_camera(10.0);
         let view_proj = camera.view_proj(SIZE.x / SIZE.y);
         let center = SIZE * 0.5;
-        let ground = pointer_world(&view_proj, SIZE, center, WorldPlane::GroundY0).unwrap();
+
+        // The level camera looks straight at the origin, so the center ray
+        // hits z = 0 at the origin — and the camera-target plane coincides
+        // with z = 0 here (both pass through the origin perpendicular to
+        // the view direction), so both planes report the same hit.
+        let ground = pointer_world(&view_proj, SIZE, center, WorldPlane::GroundZ0).unwrap();
         assert!(ground.abs_diff_eq(Vec3::ZERO, 1e-3), "got {ground:?}");
         let target =
             pointer_world(&view_proj, SIZE, center, WorldPlane::CameraTargetPlane).unwrap();
@@ -650,26 +663,21 @@ mod tests {
 
     #[test]
     fn viewport_pixels_hit_the_hand_derived_ground_points() {
-        // A tilted orbit (pitch 0.35) whose eye sits above the ground —
-        // a level camera would lie in the y = 0 plane and see it edge-on.
-        let mut camera = OrbitCamera::new(Vec3::ZERO);
-        camera.orbit(0.0, -0.25);
+        let camera = level_camera(10.0);
         let view_proj = camera.view_proj(SIZE.x / SIZE.y);
 
-        // The ground plane is world y = 0 (up is +Y), so the expected hit
-        // of a pixel is derived from its ray: origin + t·dir at t where
-        // the world y component vanishes. The ray math itself is covered
-        // by the screen_to_ray tests; this test pins the plane hit.
-        // Mid-height interior pixels: with the eye above the ground the
+        // Mid-height interior pixels: with the eye above the Z=0 ground the
         // center row looks at the target (a ground hit at the origin), so
         // rows slightly off-center stay below the horizon — rays that
-        // escape upward (much higher pixels) would miss the plane.
+        // escape upward (much higher pixels) would miss the plane. The
+        // expected hit of each pixel is derived from its own ray (the ray
+        // math is covered by the screen_to_ray tests; this pins the plane
+        // hit).
         for pixel in [Vec2::new(1728.0, 540.0), Vec2::new(192.0, 540.0)] {
-            let (origin, dir) = screen_to_ray(&view_proj, SIZE, pixel)
-                .unwrap_or_else(|| panic!("ray missing for pixel {pixel:?}"));
-            let t = -origin.y / dir.y;
+            let (origin, dir) = screen_to_ray(&view_proj, SIZE, pixel).unwrap();
+            let t = -origin.z / dir.z;
             let expected = origin + dir * t;
-            let hit = pointer_world(&view_proj, SIZE, pixel, WorldPlane::GroundY0).unwrap();
+            let hit = pointer_world(&view_proj, SIZE, pixel, WorldPlane::GroundZ0).unwrap();
             assert!(
                 hit.abs_diff_eq(expected, 1e-2),
                 "ground hit must lie on the ray plane crossing, got {hit:?}, expected {expected:?}"
@@ -692,7 +700,7 @@ mod tests {
                 &view_proj,
                 SIZE,
                 Vec2::new(1921.0, 540.0),
-                WorldPlane::GroundY0
+                WorldPlane::GroundZ0
             ),
             None
         );
@@ -701,7 +709,7 @@ mod tests {
                 &view_proj,
                 SIZE,
                 Vec2::new(960.0, 1081.0),
-                WorldPlane::GroundY0
+                WorldPlane::GroundZ0
             ),
             None
         );
@@ -711,7 +719,7 @@ mod tests {
                 &view_proj,
                 SIZE,
                 Vec2::new(f32::NAN, 540.0),
-                WorldPlane::GroundY0
+                WorldPlane::GroundZ0
             ),
             None
         );
@@ -719,24 +727,28 @@ mod tests {
 
     #[test]
     fn ground_hits_beyond_the_far_plane_are_rejected() {
-        // A camera 10 m above the ground (eye (0, 10, 10), looking at the
-        // origin) whose near/far range is hand-built: the origin ground
-        // hit lies ~14.1 m out — beyond the 5 m far plane — so the depth
-        // check (re-projected z_ndc > 1) must reject it on both planes.
-        let view_proj = hand_view_proj(Vec3::new(0.0, 10.0, 10.0), Vec3::ZERO, 0.1, 5.0);
+        // A level camera at distance 10 whose far plane sits at 5 (the
+        // orbit far plane, 100·distance, always swallows the z = 0
+        // crossing, so the hand-built range is needed): the origin ground
+        // hit is 10 m out — beyond far — and must be rejected by the depth
+        // check (re-projected z_ndc > 1) on both planes.
+        // A camera 10 m above the Z=0 ground (eye (0, −10, 10)) whose
+        // near/far range is hand-built: the origin ground hit lies ~14.1 m
+        // out — beyond the 5 m far plane — so the depth check
+        // (re-projected z_ndc > 1) must reject it on both planes.
+        let view_proj = hand_view_proj(Vec3::new(0.0, -10.0, 10.0), Vec3::ZERO, 0.1, 5.0);
         let center = SIZE * 0.5;
         assert_eq!(
-            pointer_world(&view_proj, SIZE, center, WorldPlane::GroundY0),
+            pointer_world(&view_proj, SIZE, center, WorldPlane::GroundZ0),
             None
         );
         assert_eq!(
             pointer_world(&view_proj, SIZE, center, WorldPlane::CameraTargetPlane),
             None
         );
-        // Control: the same pose with a full-depth range does hit (the
-        // ground crossing sits at t = 14.142, i.e. at the origin).
-        let view_proj = hand_view_proj(Vec3::new(0.0, 10.0, 10.0), Vec3::ZERO, 0.1, 1000.0);
-        let hit = pointer_world(&view_proj, SIZE, center, WorldPlane::GroundY0).unwrap();
+        // Control: the same pose with a full-depth range does hit.
+        let view_proj = hand_view_proj(Vec3::new(0.0, -10.0, 10.0), Vec3::ZERO, 0.1, 1000.0);
+        let hit = pointer_world(&view_proj, SIZE, center, WorldPlane::GroundZ0).unwrap();
         assert!(hit.abs_diff_eq(Vec3::ZERO, 1e-3), "got {hit:?}");
     }
 
@@ -750,7 +762,7 @@ mod tests {
         let view_proj = hand_view_proj(Vec3::new(10.0, 0.0, 0.0), Vec3::ZERO, 0.1, 1000.0);
         for pos in [SIZE * 0.5, Vec2::new(1920.0, 540.0), Vec2::ZERO, SIZE] {
             assert_eq!(
-                pointer_world(&view_proj, SIZE, pos, WorldPlane::GroundY0),
+                pointer_world(&view_proj, SIZE, pos, WorldPlane::GroundZ0),
                 None,
                 "camera on the ground plane must not hit it at {pos:?}"
             );
@@ -766,18 +778,18 @@ mod tests {
         );
         for pos in [SIZE * 0.5, Vec2::new(960.0, 0.0), Vec2::new(0.0, 540.0)] {
             assert_eq!(
-                pointer_world(&view_proj, SIZE, pos, WorldPlane::GroundY0),
+                pointer_world(&view_proj, SIZE, pos, WorldPlane::GroundZ0),
                 None,
                 "camera under the ground must not hit it at {pos:?}"
             );
         }
 
         // The camera-target plane is unaffected: it passes through the
-        // origin, so the yaw-90 center pixel hits the origin, and pixel
+        // origin, so the on-plane center pixel hits the origin, and pixel
         // (1728, 540) — exact ndc.x = 0.8, an interior pixel so the hit
         // re-projects cleanly inside the frustum — hits 0.8·10.264 ≈ 8.211
-        // out on the world −Z axis (the view's right is world −Z for this
-        // pose; hits scale linearly with ndc.x along the horizontal).
+        // out on the world +Y axis (Z-up: the view's right is world +Y for
+        // this pose; hits scale linearly with ndc.x along the horizontal).
         let center = pointer_world(&view_proj, SIZE, SIZE * 0.5, WorldPlane::CameraTargetPlane);
         assert!(center.is_none(), "target plane lies behind this camera");
         let view_proj = hand_view_proj(Vec3::new(10.0, 0.0, 0.0), Vec3::ZERO, 0.1, 1000.0);
@@ -792,8 +804,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            right.abs_diff_eq(Vec3::new(0.0, 0.0, -8.2112), 1e-2),
-            "ndc.x = 0.8 pixel must hit (0, 0, −8.2112), got {right:?}"
+            right.abs_diff_eq(Vec3::new(0.0, 8.2112, 0.0), 1e-2),
+            "ndc.x = 0.8 pixel must hit (0, 8.2112, 0), got {right:?}"
         );
     }
 
@@ -812,22 +824,23 @@ mod tests {
     }
 
     #[test]
-    fn level_camera_axes_point_right_and_up_and_the_z_axis_is_invisible() {
-        let camera = level_camera(10.0);
+    fn level_camera_axes_point_right_and_up_along_z() {
+        let camera = level_axes_camera(10.0);
         let view_proj = camera.view_proj(SIZE.x / SIZE.y);
 
-        // +X maps to clip (+m00, 0, ·, 0): screen right. +Y to (0, m11, ·):
-        // the y flip turns that into screen up. +Z is parallel to the view
-        // direction — its direction column has zero xy (the axis projects
-        // to a point at its anchor) — so it is reported invisible.
+        // Z-up convention at a level camera: +X maps to clip (+m00, 0, ·):
+        // screen right; +Z to (0, m11, ·): the y flip turns that into
+        // screen up; +Y is parallel to the view direction — its direction
+        // column has zero xy (the axis projects to a point) — so it is
+        // reported invisible.
         let corner = Rect2 {
             min: Vec2::ZERO,
             max: SIZE,
         };
         let dirs = orientation_gizmo_dirs(&view_proj, SIZE, corner, 20.0);
         assert_arm(dirs[0], 1.0, 0.0);
-        assert_arm(dirs[1], 0.0, -1.0);
-        assert_eq!(dirs[2], (Vec2::ZERO, false));
+        assert_eq!(dirs[1], (Vec2::ZERO, false));
+        assert_arm(dirs[2], 0.0, -1.0);
         // `rect` and `len` are placement hints for the caller: the computed
         // directions must not depend on them.
         let other = orientation_gizmo_dirs(&view_proj, SIZE, corner, 40.0);
@@ -835,55 +848,55 @@ mod tests {
     }
 
     #[test]
-    fn default_pose_keeps_y_up_and_runs_z_down_the_screen() {
-        // The default orbit pose (pitch 0.6 — the eye sits 10 m out on the
-        // +Z side, 34° above the origin) is the pose the app opens with.
-        // The +Y axis rises toward the eye: arm up. The +Z ground axis
-        // runs toward the camera's shadow under the eye: arm down. Both
-        // direction columns have w < 0 here (their far ends lie behind the
-        // eye) and yet keep their visible trend — the pin for the rule that
-        // the w sign never negates an arm (a blanket negation would swap
-        // the Y and Z arms of this very pose).
+    fn default_pose_keeps_z_up_and_x_right() {
+        // The default orbit pose (elevation 0.6 — the eye sits 10 m out on
+        // the −Y side, 34° above the Z=0 ground) is the pose the app opens
+        // with. With the Z-up convention the world +Z arm points up on
+        // screen, +X right, and the depth axis +Y projects a small upward
+        // trend (the tilted view looks over it).
         let camera = OrbitCamera::new(Vec3::ZERO);
         let view_proj = camera.view_proj(SIZE.x / SIZE.y);
-        let corner = Rect2 {
-            min: Vec2::ZERO,
-            max: SIZE,
-        };
-        let dirs = orientation_gizmo_dirs(&view_proj, SIZE, corner, 20.0);
-        assert_arm(dirs[0], 1.0, 0.0);
-        assert_arm(dirs[1], 0.0, -1.0);
-        assert_arm(dirs[2], 0.0, 1.0);
+        let center = SIZE * 0.5;
+        let z = anchor_to_screen(&view_proj, SIZE, Vec3::Z * 2.0).unwrap();
+        let y = anchor_to_screen(&view_proj, SIZE, Vec3::Y * 2.0).unwrap();
+        let x = anchor_to_screen(&view_proj, SIZE, Vec3::X * 2.0).unwrap();
+        assert!(z.y < center.y - 20.0, "world +Z (up) must sit above center");
+        assert!(z.y < y.y, "the up axis must dominate the depth axis");
+        assert!(
+            y.y < center.y,
+            "world +Y stays above center in the tilted view"
+        );
+        assert!(x.x > center.x + 40.0, "world +X must sit right of center");
+        assert!(
+            (x.y - center.y).abs() < 1.0,
+            "+X stays on the horizontal centerline"
+        );
     }
 
     #[test]
     fn camera_behind_the_scene_mirrors_the_x_axis() {
-        // Hand-built level camera at (0, 0, −10) looking at the origin
-        // (yaw 180 — orbit yaw cannot land exactly on π in f32): the world
-        // is seen from behind, so +X runs left on screen, +Y stays up, and
-        // +Z recedes straight down the barrel of the view (invisible).
-        let view_proj = hand_view_proj(Vec3::new(0.0, 0.0, -10.0), Vec3::ZERO, 0.1, 1000.0);
+        // Hand-built level camera behind the scene (eye at +Y, on the far
+        // side of the origin — yaw cannot land exactly on π in orbit f32):
+        // the world is seen from behind, so +X runs left on screen, +Z
+        // stays up, and +Y recedes straight down the barrel of the view
+        // (invisible).
+        let view_proj = hand_view_proj(Vec3::new(0.0, 10.0, 0.0), Vec3::ZERO, 0.1, 1000.0);
         let corner = Rect2 {
             min: Vec2::ZERO,
             max: SIZE,
         };
         let dirs = orientation_gizmo_dirs(&view_proj, SIZE, corner, 20.0);
         assert_arm(dirs[0], -1.0, 0.0);
-        assert_arm(dirs[1], 0.0, -1.0);
-        assert_eq!(dirs[2], (Vec2::ZERO, false));
+        assert_arm(dirs[2], 0.0, -1.0);
+        assert_eq!(dirs[1], (Vec2::ZERO, false));
     }
 
     #[test]
     fn axis_passing_near_the_eye_keeps_its_screen_trend() {
-        // Yaw-45 level camera at 10·(sin 45°, 0, cos 45°): the +X axis
-        // passes 7.07 m from the eye and its visible half runs from the
-        // origin toward the eye's side — on screen to the right, exactly
-        // along the +X column's xy. The column's w is negative here (the
-        // axis's far end lies behind the eye), yet the arm must NOT be
-        // negated: a flip would point it along the hidden −X half, against
-        // what the scene shows. +Z runs to the view's left for this pose
-        // (the view right is the +X/+Z bisector).
-        let mut camera = level_camera(10.0);
+        // Yaw-π/4 elevation-0.6 pose: the +X axis passes near the eye and
+        // its visible half keeps running rightward on screen; +Z stays
+        // upward — the near-eye projection is never mirrored by a sign flip.
+        let mut camera = OrbitCamera::new(Vec3::ZERO);
         camera.orbit(FRAC_PI_4, 0.0);
         let view_proj = camera.view_proj(SIZE.x / SIZE.y);
         let corner = Rect2 {
@@ -891,9 +904,10 @@ mod tests {
             max: SIZE,
         };
         let dirs = orientation_gizmo_dirs(&view_proj, SIZE, corner, 20.0);
-        assert_arm(dirs[0], 1.0, 0.0);
-        assert_arm(dirs[1], 0.0, -1.0);
-        assert_arm(dirs[2], -1.0, 0.0);
+        assert!(dirs[0].1, "X arm visible");
+        assert!(dirs[0].0.x > 0.3, "X leans right, got {:?}", dirs[0].0);
+        assert!(dirs[2].1, "Z arm visible");
+        assert!(dirs[2].0.y < -0.3, "Z leans up, got {:?}", dirs[2].0);
     }
 
     #[test]

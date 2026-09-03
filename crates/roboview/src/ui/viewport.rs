@@ -893,7 +893,7 @@ impl ViewportState {
         let aspect = rect.width() / rect.height();
         let view_proj = self.scene.camera.view_proj(aspect);
         let plane = if self.grid_on {
-            roboview_core::render::camera_math::WorldPlane::GroundY0
+            roboview_core::render::camera_math::WorldPlane::GroundZ0
         } else {
             roboview_core::render::camera_math::WorldPlane::CameraTargetPlane
         };
@@ -961,7 +961,7 @@ impl ViewportState {
             return;
         };
         let view = render::grid::GridView::new(
-            Vec3::new(window.center.x, 0.0, window.center.y),
+            Vec3::new(window.center.x, window.center.y, 0.0),
             render::grid::GridOptions::new(GRID_MINOR_STEP, GRID_MAJOR_STEP, window.radius),
         );
         let strips = render::grid::grid_strips(&view);
@@ -1164,8 +1164,8 @@ fn write_appearance_uniform(
 // — Ground-grid generation window (pure math: no GPU types, so the tests
 //   at the end of this file exercise it headlessly) —
 
-/// A square generation window of the ground grid on the world Y=0 plane:
-/// `center` holds the plane coordinates (x, z) of the window center, and
+/// A square generation window of the ground grid on the world Z=0 plane:
+/// `center` holds the world (x, y) coordinates of the window center, and
 /// the grid spans `center ± radius` — every ground point visible from the
 /// camera lies inside the square.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1178,7 +1178,7 @@ struct GridWindow {
 /// `view_proj` on a `viewport` of egui points (any uniform scale works —
 /// the math only uses ratios):
 ///
-/// - the visible ground is the intersection of the Y=0 plane with the
+/// - the visible ground is the intersection of the Z=0 plane with the
 ///   frustum — a convex polygon whose vertices are the crossings of the
 ///   plane with the twelve frustum edges (four eye-to-far-corner rays,
 ///   four near-rectangle edges, four far-rectangle edges);
@@ -1244,7 +1244,7 @@ fn grid_window(view_proj: &Mat4, viewport: Vec2) -> Option<GridWindow> {
         view_proj,
         viewport,
         viewport * 0.5,
-        render::camera_math::WorldPlane::GroundY0,
+        render::camera_math::WorldPlane::GroundZ0,
     ) {
         Some(hit) => hit.truncate(),
         None => {
@@ -1276,20 +1276,19 @@ fn grid_window(view_proj: &Mat4, viewport: Vec2) -> Option<GridWindow> {
     })
 }
 
-/// Push the crossing of the segment `a → b` with the world plane y = 0
-/// (world up is +Y — the plane the ground grid lies on). A segment
-/// parallel to the plane never crosses it — an entire edge lying *on* the
-/// plane contributes no vertex either, because the crossings of the
-/// adjacent edges bound that stretch. The acceptance window
-/// `s ∈ [−ε, 1+ε]` admits crossings a hair outside the segment so float
-/// rounding at an endpoint cannot drop a real vertex (the window margin
-/// absorbs the slack).
+/// Push the crossing of the segment `a → b` with the world plane z = 0
+/// into `out`. A segment parallel to the plane never crosses it — an
+/// entire edge lying *on* the plane contributes no vertex either, because
+/// the crossings of the adjacent edges bound that stretch. The acceptance
+/// window `s ∈ [−ε, 1+ε]` admits crossings a hair outside the segment so
+/// float rounding at an endpoint cannot drop a real vertex (the window
+/// margin absorbs the slack).
 fn push_plane_crossing(a: Vec3, b: Vec3, out: &mut Vec<Vec3>) {
-    let dy = b.y - a.y;
-    if dy == 0.0 {
+    let dz = b.z - a.z;
+    if dz == 0.0 {
         return;
     }
-    let s = -a.y / dy;
+    let s = -a.z / dz;
     if !s.is_finite() || !(-1.0e-3..=1.0 + 1.0e-3).contains(&s) {
         return;
     }
@@ -1893,7 +1892,7 @@ mod tests {
                             // (the module clamps every endpoint to the
                             // window before the f32 cast).
                             let view = GridView::new(
-                                Vec3::new(window.center.x, 0.0, window.center.y),
+                                Vec3::new(window.center.x, window.center.y, 0.0),
                                 GridOptions::new(GRID_MINOR_STEP, GRID_MAJOR_STEP, window.radius),
                             );
                             let strips = grid_strips(&view);
@@ -1923,7 +1922,7 @@ mod tests {
                             let mut hits = 0usize;
                             for pos in sample_pixels(viewport, 33) {
                                 if let Some(hit) =
-                                    pointer_world(&view_proj, viewport, pos, WorldPlane::GroundY0)
+                                    pointer_world(&view_proj, viewport, pos, WorldPlane::GroundZ0)
                                 {
                                     hits += 1;
                                     assert!(
@@ -1955,21 +1954,22 @@ mod tests {
 
     #[test]
     fn grid_window_none_when_the_ground_stays_beyond_the_far_plane() {
-        // A distant elevated target viewed from up close, almost level: the
-        // far plane sits at 100·distance = 10 m, while the ground plane
-        // (world y = 0) lies ~90 m below the eye. Even the corner rays —
-        // whose far end dips below the naive far distance because they
-        // travel off-axis to reach the far plane — cannot fall 90 m in
-        // 10 m of range: no frustum edge can cross the plane, no ground is
-        // visible. The pointer math agrees — zero hits across the dense
-        // sample.
-        let camera = pose(Vec3::new(0.0, 90.0, 0.0), 0.0, 0.05, 0.1);
+        // A distant target viewed from up close, almost level: the far plane
+        // sits at 100·distance = 10 m, while the Z=0 plane lies ~90 m in
+        // front of the eye. Even the corner rays — whose far end dips below
+        // the naive far distance because they travel off-axis to reach the
+        // far plane — carry a z-numerator of at most ~2.4
+        // (tan(30°)·aspect + 1 + tan(30°) at the 4:3 viewport), so the
+        // whole far ring stays ≥ 66 m above the plane: no frustum edge can
+        // cross it, no ground is visible. The pointer math agrees — zero
+        // hits across the dense sample.
+        let camera = pose(Vec3::new(0.0, 0.0, 90.0), 0.0, 0.05, 0.1);
         let view_proj = camera.view_proj(4.0 / 3.0);
         let viewport = Vec2::new(480.0, 360.0);
         assert_eq!(grid_window(&view_proj, viewport), None);
         for pos in sample_pixels(viewport, 32) {
             assert!(
-                pointer_world(&view_proj, viewport, pos, WorldPlane::GroundY0).is_none(),
+                pointer_world(&view_proj, viewport, pos, WorldPlane::GroundZ0).is_none(),
                 "the ground is beyond the far plane: {pos:?} must not hit"
             );
         }

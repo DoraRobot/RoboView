@@ -15,16 +15,18 @@
 //!   current state and rolls the state back when the result would not be
 //!   finite: no input event can corrupt the camera.
 //!
-//! Convention: right-handed coordinates, +Y up in both world and view space.
-//! The eye position is derived from the spherical offset around `target`:
+//! Convention: right-handed coordinates, **Z up** — the mature-3D-tool
+//! convention (Blender, glTF, ROS: the world Z axis is "up", the ground
+//! plane is Z=0, axes letters X red / Y green / Z blue). The eye position
+//! is derived from the spherical offset around `target`:
 //!
 //! ```text
-//! eye = target + distance · (cos(pitch)·sin(yaw), sin(pitch), cos(pitch)·cos(yaw))
+//! eye = target + distance · (cos(pitch)·sin(yaw), −cos(pitch)·cos(yaw), sin(pitch))
 //! ```
 //!
-//! `yaw = 0` puts the eye on the +Z side of the target; positive `pitch`
-//! raises the eye above it. The projection maps depth to the wgpu/WebGPU
-//! NDC range `z ∈ [0, 1]` (near plane = 0, far plane = 1).
+//! `yaw = 0` puts the eye on the −Y side of the target; positive `pitch`
+//! raises the eye above the Z=0 ground plane. The projection maps depth to
+//! the wgpu/WebGPU NDC range `z ∈ [0, 1]` (near plane = 0, far plane = 1).
 
 use std::f32::consts::{FRAC_PI_2, FRAC_PI_3};
 
@@ -155,7 +157,7 @@ impl OrbitCamera {
         self.target
     }
 
-    /// Yaw around the world +Y axis, in radians.
+    /// Yaw around the world +Z axis, in radians.
     pub fn yaw(&self) -> f32 {
         self.yaw
     }
@@ -174,7 +176,7 @@ impl OrbitCamera {
     fn eye(&self) -> Vec3 {
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
         let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
-        let eye_offset = Vec3::new(cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw);
+        let eye_offset = Vec3::new(cos_pitch * sin_yaw, -cos_pitch * cos_yaw, sin_pitch);
         self.target + eye_offset * self.distance
     }
 
@@ -185,12 +187,14 @@ impl OrbitCamera {
     /// pan directions and the view matrix always agree.
     ///
     /// Non-degenerate for every pose reachable through the public API: the
-    /// pitch clamp keeps `|forward · Y| ≤ cos(0.01)`.
+    /// pitch clamp keeps `|forward · Z| ≤ cos(0.01)`.
     fn view_axes(&self) -> (Vec3, Vec3, Vec3) {
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
         let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
-        let forward = -Vec3::new(cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw);
-        let right = forward.cross(Vec3::Y).normalize();
+        let forward = -Vec3::new(cos_pitch * sin_yaw, -cos_pitch * cos_yaw, sin_pitch);
+        // World up is +Z (Z-up convention): the view basis spans the screen
+        // plane with `up = right × forward`, right-handed.
+        let right = forward.cross(Vec3::Z).normalize();
         let up = right.cross(forward);
         (forward, right, up)
     }
@@ -245,7 +249,8 @@ impl OrbitCamera {
         } else {
             1.0
         };
-        let view = glam::camera::rh::view::look_at_mat4(self.eye(), self.target, Vec3::Y);
+        // Z-up world: the view basis is built around world up = +Z.
+        let view = glam::camera::rh::view::look_at_mat4(self.eye(), self.target, Vec3::Z);
         let proj = glam::camera::rh::proj::directx::perspective(
             FOV_Y,
             aspect,
@@ -413,12 +418,12 @@ mod tests {
     #[test]
     fn pan_moves_the_target_in_the_screen_plane_scaled_by_distance() {
         let mut cam = OrbitCamera::new(Vec3::ZERO);
-        cam.orbit(0.0, -DEFAULT_PITCH); // level view (pitch 0): right = +X, up = +Y
+        cam.orbit(0.0, -DEFAULT_PITCH); // level view (pitch 0): right = +X, up = +Z
         let distance = cam.distance();
         cam.pan(Vec2::new(0.25, -0.5));
         assert!(
             cam.target()
-                .abs_diff_eq(Vec3::new(0.25, -0.5, 0.0) * distance, 1e-6)
+                .abs_diff_eq(Vec3::new(0.25, 0.0, -0.5) * distance, 1e-6)
         );
         // Pan never changes zoom or orientation.
         assert_eq!(cam.distance(), distance);
@@ -509,15 +514,16 @@ mod tests {
 
     #[test]
     fn view_is_never_flipped_vertically_or_horizontally() {
-        // World +Y of the target must map to NDC up and world +X (camera
-        // right at yaw = 0) to NDC right at every elevation: any handedness
-        // or vertical-flip regression in the view/projection pair fails here.
+        // World +Z of the target must map to NDC up (Z-up convention) and
+        // world +X (camera right at yaw = 0) to NDC right at every
+        // elevation: any handedness or vertical-flip regression in the
+        // view/projection pair fails here.
         let bounds = box_from(Vec3::ZERO, 1.0);
         for pitch_delta in [-1.5, -0.8, 0.0, 0.8, 1.5] {
             let mut cam = OrbitCamera::framing(Some(&bounds));
             cam.orbit(0.0, pitch_delta);
             let vp = cam.view_proj(1.0);
-            let above = vp.project_point3(Vec3::Y * 0.1);
+            let above = vp.project_point3(Vec3::Z * 0.1);
             assert!(above.y > 0.0, "above-target must stay above center");
             let right = vp.project_point3(Vec3::X * 0.1);
             assert!(right.x > 0.0, "right-of-target must stay right of center");
