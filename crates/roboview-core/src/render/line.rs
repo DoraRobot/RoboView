@@ -69,10 +69,20 @@ const LINE_AMBER_SRGB: io::Color = io::Color {
     b: 100,
 };
 
-/// Frame axis colors as sRGB bytes: X red, Y green, Z blue (spec §7 F3).
-const AXIS_X_COLOR_SRGB: io::Color = io::Color { r: 255, g: 0, b: 0 };
-const AXIS_Y_COLOR_SRGB: io::Color = io::Color { r: 0, g: 255, b: 0 };
-const AXIS_Z_COLOR_SRGB: io::Color = io::Color { r: 0, g: 0, b: 255 };
+/// Frame axis color of X as sRGB bytes: X red (display-types spec §7 F3,
+/// semantic color A4). Pure red `(255, 0, 0)` — no gamma or alpha deviation
+/// from the spec semantics. `pub` so the app's semantic palette (ui-blueprint
+/// spec §6 A9) can assert its origin-axes token against the exact color the
+/// frame pipeline draws.
+pub const AXIS_X_COLOR_SRGB: io::Color = io::Color { r: 255, g: 0, b: 0 };
+
+/// Frame axis color of Y as sRGB bytes: Y green (display-types spec §7 F3,
+/// semantic color A4). Pure green `(0, 255, 0)`.
+pub const AXIS_Y_COLOR_SRGB: io::Color = io::Color { r: 0, g: 255, b: 0 };
+
+/// Frame axis color of Z as sRGB bytes: Z blue (display-types spec §7 F3,
+/// semantic color A4). Pure blue `(0, 0, 255)`.
+pub const AXIS_Z_COLOR_SRGB: io::Color = io::Color { r: 0, g: 0, b: 255 };
 
 /// Arrow head length as a fraction of the shaft length.
 const ARROW_HEAD_FRACTION: f32 = 0.25;
@@ -519,6 +529,19 @@ mod tests {
             );
             assert_eq!(strip.vertices, [origin, origin + axis * 2.0]);
         }
+    }
+
+    #[test]
+    fn axis_color_constants_match_002_a4_semantic_colors() {
+        // Semantic lock (display-types spec A4, §7 F3): frame axes are
+        // X red / Y green / Z blue as pure sRGB bytes — X=(255,0,0),
+        // Y=(0,255,0), Z=(0,0,255), no gamma or alpha deviation. The app's
+        // ui-blueprint palette (spec §6 A9) asserts its origin-axes token
+        // against these `pub` constants, so this test pins them to the spec
+        // semantics they stand in for.
+        assert_eq!(AXIS_X_COLOR_SRGB, io::Color { r: 255, g: 0, b: 0 });
+        assert_eq!(AXIS_Y_COLOR_SRGB, io::Color { r: 0, g: 255, b: 0 });
+        assert_eq!(AXIS_Z_COLOR_SRGB, io::Color { r: 0, g: 0, b: 255 });
     }
 
     #[test]
