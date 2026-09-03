@@ -31,6 +31,16 @@
 //! draw), and every strip that reaches the GPU has at least two finite
 //! vertices.
 //!
+//! # Persistent line meshes (004 ui-blueprint)
+//!
+//! Besides the upload forms above, the pipeline provisions the 004 viewport
+//! helper form ([`LinePipeline::with_capacity`],
+//! [`LinePipeline::update_mesh`]): vertex buffers preallocated once and
+//! refreshed in place by queue writes — the ground-grid refresh path
+//! (plan §3.3) that must never provision GPU objects per frame. Helper
+//! layers are not scene objects: their mesh is owned by the viewport and
+//! records no A6 ledger rows (spec §6: 不入场景树、不参与台账).
+//!
 //! # Shared depth policy (spec §6, plan §3.3)
 //!
 //! The pipeline depth-tests with a strict Less compare, never writes depth,
@@ -239,11 +249,12 @@ fn pack_strips(strips: &[CpuStrip]) -> (Vec<u8>, Vec<u8>, Vec<(u32, u32)>) {
     (position_bytes, color_bytes, ranges)
 }
 
-/// GPU handles of one uploaded line geometry: the positions and per-vertex
-/// color buffers plus the bind group referencing the renderer's scene-wide
+/// GPU handles of one line geometry: the positions and per-vertex color
+/// buffers plus the bind group referencing the renderer's scene-wide
 /// view-projection uniform buffer. Owned by the caller (a path, frame, or
-/// marker-arrow display behind an [`Arc`]); dropping it frees the buffers
-/// through wgpu's deferred destruction, exactly like
+/// marker-arrow display behind an [`Arc`], or the viewport itself for the
+/// persistent helper form of [`LinePipeline::with_capacity`]); dropping it
+/// frees the buffers through wgpu's deferred destruction, exactly like
 /// [`crate::render::renderer::PointCloudMesh`] (`renderer` module).
 pub struct LineMesh {
     positions: wgpu::Buffer,
@@ -253,6 +264,18 @@ pub struct LineMesh {
     /// empty (e.g. an all-non-finite path) — paint then draws nothing.
     strips: Vec<(u32, u32)>,
     bind_group: wgpu::BindGroup,
+    /// Vertex capacity the `positions`/`colors` buffers were sized for: the
+    /// vertex count of the upload, or the `with_capacity` preallocation for
+    /// the persistent form. [`LinePipeline::update_mesh`] refuses refreshes
+    /// beyond it, so the buffers are never recreated.
+    vertex_capacity: u32,
+    /// CPU staging buffers of the persistent form ([`LinePipeline::with_capacity`]),
+    /// preallocated to the vertex capacity and reused by every
+    /// [`LinePipeline::update_mesh`] refresh — a refresh allocates no
+    /// staging and no GPU objects. Empty for upload-returned meshes, whose
+    /// geometry never refreshes.
+    staging_positions: Vec<u8>,
+    staging_colors: Vec<u8>,
 }
 
 /// Owns the line pipeline and uploads line geometry; one instance per
@@ -363,6 +386,11 @@ impl LinePipeline {
 
     fn upload_strips(&self, strips: &[CpuStrip]) -> Arc<LineMesh> {
         let (position_bytes, color_bytes, ranges) = pack_strips(strips);
+        let total_vertices = u32::try_from(position_bytes.len() / POSITION_STRIDE_BYTES as usize)
+            .expect(
+                "more than u32::MAX line vertices cannot be drawn; the io size guards \
+                     bound the point count far below that",
+            );
 
         let positions = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("line.positions"),
@@ -393,6 +421,9 @@ impl LinePipeline {
             colors,
             strips: ranges,
             bind_group,
+            vertex_capacity: total_vertices,
+            staging_positions: Vec::new(),
+            staging_colors: Vec::new(),
         })
     }
 
@@ -408,6 +439,135 @@ impl LinePipeline {
         for &(start, count) in &mesh.strips {
             pass.draw(start..start + count, 0..1);
         }
+    }
+
+    /// Create a persistent [`LineMesh`] whose vertex buffers are
+    /// preallocated for `segments` two-vertex strips (2·segments vertices)
+    /// — the viewport-helper form (ground grid, spec §6/plan §3.3). The
+    /// buffers, bind groups, and the CPU staging are all created once here
+    /// and refreshed in place by [`LinePipeline::update_mesh`], which never
+    /// provisions GPU objects — a per-frame refresh therefore never touches
+    /// the A6 ledger (helper layers are not scene objects, spec §6) and
+    /// never rebuilds anything.
+    ///
+    /// `segments` must cover the largest refresh the caller will issue; the
+    /// grid module's [`super::grid::segment_capacity_bound`] exists for
+    /// exactly this prebuild (the bound holds for every window radius up to
+    /// the options' radius). The mesh is owned by the caller (viewport
+    /// state) and starts empty — paint draws nothing until the first
+    /// [`LinePipeline::update_mesh`].
+    pub fn with_capacity(&self, segments: usize) -> LineMesh {
+        let vertices = segments
+            .checked_mul(2)
+            .expect("a line mesh capacity of more than usize::MAX segments is not addressable");
+        let vertices = u32::try_from(vertices).expect(
+            "a persistent line mesh cannot exceed u32::MAX vertices; the grid capacity \
+             bounds are far below that",
+        );
+        // Staging sized to the same vertex capacity in bytes: update_mesh
+        // refreshes into these vectors and never reallocates.
+        let vertex_capacity = usize::try_from(vertices)
+            .expect("a vertex capacity of u32::MAX always fits usize on every supported target");
+        let positions = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("line.persistent.positions"),
+            size: u64::from(vertices) * POSITION_STRIDE_BYTES,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let colors = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("line.persistent.colors"),
+            size: u64::from(vertices) * COLOR_STRIDE_BYTES,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("line.persistent"),
+            layout: &self.bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        LineMesh {
+            positions,
+            colors,
+            strips: Vec::with_capacity(segments),
+            bind_group,
+            vertex_capacity: vertices,
+            staging_positions: Vec::with_capacity(vertex_capacity * POSITION_STRIDE_BYTES as usize),
+            staging_colors: Vec::with_capacity(vertex_capacity * COLOR_STRIDE_BYTES as usize),
+        }
+    }
+
+    /// Refresh the geometry of a persistent mesh in place — the ground-grid
+    /// refresh path (plan §3.3): packs `segments` (each `[Vec3; 2]` becomes
+    /// one two-vertex `LineStrip` in one color) into the mesh's preallocated
+    /// staging and writes both vertex buffers with a single queue write
+    /// each. No buffer, bind group, uniform, or pipeline is ever created
+    /// here, and the mesh keeps every handle across calls — only
+    /// `queue.write_buffer` touches the GPU (spec §6: 持久 LineMesh 容量预建
+    /// + `queue.write_buffer` 就地刷新).
+    ///
+    /// Panics when `segments` need more vertices than the mesh was prebuilt
+    /// for — choose the capacity with [`LinePipeline::with_capacity`] for
+    /// the largest refresh (e.g. [`super::grid::segment_capacity_bound`] of
+    /// the maximum camera window), not per refresh.
+    pub fn update_mesh(&self, mesh: &mut LineMesh, segments: &[[Vec3; 2]], color: io::Color) {
+        let vertices = u32::try_from(segments.len() * 2)
+            .expect("a persistent mesh cannot refresh more than u32::MAX vertices");
+        assert!(
+            vertices <= mesh.vertex_capacity,
+            "update_mesh needs {vertices} vertices but the mesh was prebuilt for {} — \
+             refresh cannot exceed the with_capacity preallocation",
+            mesh.vertex_capacity
+        );
+
+        pack_segments_into(
+            segments,
+            color,
+            &mut mesh.staging_positions,
+            &mut mesh.staging_colors,
+            &mut mesh.strips,
+        );
+        self.queue
+            .write_buffer(&mesh.positions, 0, &mesh.staging_positions);
+        self.queue
+            .write_buffer(&mesh.colors, 0, &mesh.staging_colors);
+    }
+}
+
+/// Pack `segments` into caller-provided buffers: each `[Vec3; 2]` becomes
+/// one two-vertex `LineStrip`, all in one sRGB `color`. The byte format is
+/// identical to [`pack_strips`]'s (positions little-endian f32 triples,
+/// per-vertex Rgba8Unorm color bytes), so the shader and the pipeline are
+/// shared with the upload forms — a unit test pins the two packers against
+/// each other. The three buffers are *cleared and refilled*, keeping their
+/// capacity: [`LinePipeline::update_mesh`] preallocates them in
+/// [`LinePipeline::with_capacity`] and a refresh never reallocates.
+fn pack_segments_into(
+    segments: &[[Vec3; 2]],
+    color: io::Color,
+    position_bytes: &mut Vec<u8>,
+    color_bytes: &mut Vec<u8>,
+    ranges: &mut Vec<(u32, u32)>,
+) {
+    position_bytes.clear();
+    color_bytes.clear();
+    ranges.clear();
+    let mut start = 0u32;
+    for segment in segments {
+        let count = 2u32;
+        start = start
+            .checked_add(count)
+            .expect("total line vertices exceed u32::MAX; the capacity guards prevent this");
+        for vertex in segment {
+            position_bytes.extend_from_slice(&vertex.x.to_le_bytes());
+            position_bytes.extend_from_slice(&vertex.y.to_le_bytes());
+            position_bytes.extend_from_slice(&vertex.z.to_le_bytes());
+            color_bytes.extend_from_slice(&[color.r, color.g, color.b, 255]);
+        }
+        ranges.push((start - count, count));
     }
 }
 
@@ -678,6 +838,265 @@ mod tests {
                 LINE_SHADER_SOURCE.contains(constant),
                 "line.wgsl is missing sRGB constant {constant}"
             );
+        }
+    }
+
+    #[test]
+    fn persistent_packer_matches_the_upload_packer_byte_for_byte() {
+        // The persistent form (`pack_segments_into`) and the upload form
+        // (`pack_strips`) must produce identical bytes and ranges for the
+        // same geometry, because both feed the same vertex buffers, bind
+        // groups, and shader — one pipeline, two fill paths. Each segment
+        // becomes one canonical two-vertex strip.
+        let segments = [
+            [point(0.0, 0.0, 0.0), point(1.0, 0.0, 0.0)],
+            [point(1.0, 0.0, 0.0), point(1.0, 1.0, 0.0)],
+            [point(1.0, 1.0, 0.0), point(0.0, 1.0, 0.0)],
+        ];
+        let color = io::Color {
+            r: 90,
+            g: 160,
+            b: 220,
+        };
+        let mut positions = Vec::with_capacity(segments.len() * 2 * POSITION_STRIDE_BYTES as usize);
+        let mut colors = Vec::with_capacity(segments.len() * 2 * COLOR_STRIDE_BYTES as usize);
+        let mut ranges = Vec::with_capacity(segments.len());
+        pack_segments_into(&segments, color, &mut positions, &mut colors, &mut ranges);
+
+        assert_eq!(
+            ranges,
+            [(0, 2), (2, 2), (4, 2)],
+            "one two-vertex strip per segment"
+        );
+        assert_eq!(
+            positions.len(),
+            3 * 2 * POSITION_STRIDE_BYTES as usize,
+            "two vertices per segment"
+        );
+        assert_eq!(
+            colors.len(),
+            3 * 2 * COLOR_STRIDE_BYTES as usize,
+            "one color byte quadruple per vertex"
+        );
+
+        // The upload packer of the same strips: identical bytes.
+        let strips: Vec<CpuStrip> = segments
+            .iter()
+            .map(|segment| CpuStrip {
+                color,
+                vertices: segment.to_vec(),
+            })
+            .collect();
+        let (expected_positions, expected_colors, expected_ranges) = pack_strips(&strips);
+        assert_eq!(positions, expected_positions);
+        assert_eq!(colors, expected_colors);
+        assert_eq!(ranges, expected_ranges);
+
+        // Vertex colors repeat the strip color per vertex, like the upload
+        // form (Rgba8Unorm sRGB bytes, opaque alpha).
+        assert_eq!(&colors[0..4], &[90, 160, 220, 255]);
+        assert_eq!(
+            &colors[8..12],
+            &[90, 160, 220, 255],
+            "vertex 2 is strip 2's first vertex"
+        );
+    }
+
+    #[test]
+    fn persistent_refresh_reuses_its_staging_buffers() {
+        // The T6 zero-allocation claim, tested headlessly on the exact
+        // buffers `update_mesh` refreshes (CI has no GPU device to create a
+        // real `LineMesh`): `with_capacity` preallocates the staging
+        // vectors; repeated refresh — including shrinking refreshes — must
+        // keep each allocation's identity and capacity and only rewrite
+        // contents, exactly like the GPU-side writes of `update_mesh`,
+        // which create no buffer, bind group, or staging of their own.
+        let segments_a = [
+            [point(0.0, 0.0, 0.0), point(1.0, 0.0, 0.0)],
+            [point(1.0, 0.0, 0.0), point(1.0, 1.0, 0.0)],
+            [point(1.0, 1.0, 0.0), point(0.0, 1.0, 0.0)],
+        ];
+        let segments_b = [[point(5.0, 5.0, 0.0), point(6.0, 5.0, 0.0)]];
+        let color_a = io::Color {
+            r: 90,
+            g: 160,
+            b: 220,
+        };
+        let color_b = AXIS_Y_COLOR_SRGB;
+
+        // Staging sized as `with_capacity(segments_a.len())` would size it.
+        let mut positions =
+            Vec::with_capacity(segments_a.len() * 2 * POSITION_STRIDE_BYTES as usize);
+        let mut colors = Vec::with_capacity(segments_a.len() * 2 * COLOR_STRIDE_BYTES as usize);
+        let mut ranges = Vec::with_capacity(segments_a.len());
+
+        pack_segments_into(
+            &segments_a,
+            color_a,
+            &mut positions,
+            &mut colors,
+            &mut ranges,
+        );
+        let position_ptr = positions.as_ptr();
+        let color_ptr = colors.as_ptr();
+        let ranges_ptr = ranges.as_ptr();
+        let position_capacity = positions.capacity();
+        let color_capacity = colors.capacity();
+        let ranges_capacity = ranges.capacity();
+
+        // 32 refresh rounds alternating a full and a shrinking refresh —
+        // the camera-motion pattern of the ground grid (plan §3.3).
+        for _ in 0..32 {
+            pack_segments_into(
+                &segments_a,
+                color_a,
+                &mut positions,
+                &mut colors,
+                &mut ranges,
+            );
+            pack_segments_into(
+                &segments_b,
+                color_b,
+                &mut positions,
+                &mut colors,
+                &mut ranges,
+            );
+        }
+
+        assert_eq!(
+            positions.as_ptr(),
+            position_ptr,
+            "refresh must never reallocate the position staging"
+        );
+        assert_eq!(colors.as_ptr(), color_ptr);
+        assert_eq!(ranges.as_ptr(), ranges_ptr);
+        assert_eq!(positions.capacity(), position_capacity);
+        assert_eq!(colors.capacity(), color_capacity);
+        assert_eq!(ranges.capacity(), ranges_capacity);
+
+        // Contents are exactly the last (shrunk) refresh: the two green
+        // vertices of segments_b.
+        let (expected_positions, expected_colors, expected_ranges) = pack_strips(&[CpuStrip {
+            color: color_b,
+            vertices: segments_b[0].to_vec(),
+        }]);
+        assert_eq!(positions, expected_positions);
+        assert_eq!(colors, expected_colors);
+        assert_eq!(ranges, expected_ranges);
+    }
+
+    #[test]
+    fn empty_and_exact_capacity_refreshes_pack_cleanly() {
+        // An empty refresh clears the mesh to nothing — the grid's
+        // "no grid" state — without touching the preallocated staging.
+        let mut positions = Vec::with_capacity(8 * POSITION_STRIDE_BYTES as usize);
+        let mut colors = Vec::with_capacity(8 * COLOR_STRIDE_BYTES as usize);
+        let mut ranges = Vec::with_capacity(4);
+        pack_segments_into(
+            &[],
+            AXIS_X_COLOR_SRGB,
+            &mut positions,
+            &mut colors,
+            &mut ranges,
+        );
+        assert!(positions.is_empty() && colors.is_empty() && ranges.is_empty());
+        assert!(positions.capacity() >= 8 * POSITION_STRIDE_BYTES as usize);
+
+        // A refresh of exactly `capacity` segments needs exactly 2·capacity
+        // vertices — the boundary `update_mesh`'s vertex guard admits
+        // (anything beyond it would trip the assert and means the caller
+        // under-provisioned `with_capacity`).
+        let capacity = 1000usize;
+        let segments: Vec<[Vec3; 2]> = (0..capacity)
+            .map(|k| [point(k as f32, 0.0, 0.0), point(k as f32, 1.0, 0.0)])
+            .collect();
+        pack_segments_into(
+            &segments,
+            LINE_AMBER_SRGB,
+            &mut positions,
+            &mut colors,
+            &mut ranges,
+        );
+        assert_eq!(
+            positions.len(),
+            capacity * 2 * POSITION_STRIDE_BYTES as usize
+        );
+        assert_eq!(colors.len(), capacity * 2 * COLOR_STRIDE_BYTES as usize);
+        assert_eq!(ranges.len(), capacity);
+        assert_eq!(ranges.first(), Some(&(0, 2)));
+        assert_eq!(ranges.last(), Some(&((2 * (capacity - 1)) as u32, 2)));
+        // 2·capacity vertices stay inside the 2·capacity vertex prebuild.
+        let vertex_capacity = capacity * 2;
+        assert!(segments.len() * 2 <= vertex_capacity);
+    }
+
+    #[test]
+    fn grid_sweep_fits_a_mesh_prebuilt_for_the_maximum_window() {
+        // The T13 integration contract, headless: the viewport provisions
+        // ONE persistent line mesh with
+        // `with_capacity(segment_capacity_bound(&maximum_options))` and
+        // refreshes it every frame with `grid_strips` output as the camera
+        // moves. Any window radius up to the prebuilt maximum must fit that
+        // capacity, and the refresh must not reallocate its staging (spec
+        // §6: 容量预建 + queue.write_buffer 就地刷新).
+        use crate::render::grid::{GridOptions, GridView, grid_strips, segment_capacity_bound};
+
+        let grid_color = io::Color {
+            r: 210,
+            g: 210,
+            b: 215,
+        };
+        let bound = segment_capacity_bound(&GridOptions::new(0.2, 1.0, 1000.0));
+        assert!(bound > 0);
+
+        // Staging exactly as `with_capacity(bound)` provisions it: two
+        // vertices per prebuilt segment.
+        let mut positions = Vec::with_capacity(bound * 2 * POSITION_STRIDE_BYTES as usize);
+        let mut colors = Vec::with_capacity(bound * 2 * COLOR_STRIDE_BYTES as usize);
+        let mut ranges = Vec::with_capacity(bound);
+        let position_ptr = positions.as_ptr();
+        let color_ptr = colors.as_ptr();
+
+        let radii = [0.4, 4.4, 10.0, 60.0, 100.0, 250.0, 452.6, 1000.0];
+        let centers = [[0.0f32, 0.0], [0.33, 0.77], [12.3, -45.6], [-999.5, 777.7]];
+        for [cx, cy] in centers {
+            for radius in radii {
+                let view =
+                    GridView::new(Vec3::new(cx, cy, 0.0), GridOptions::new(0.2, 1.0, radius));
+                let strips = grid_strips(&view);
+                assert!(!strips.is_empty());
+
+                pack_segments_into(
+                    &strips,
+                    grid_color,
+                    &mut positions,
+                    &mut colors,
+                    &mut ranges,
+                );
+                assert_eq!(
+                    positions.len(),
+                    strips.len() * 2 * POSITION_STRIDE_BYTES as usize
+                );
+                assert_eq!(colors.len(), strips.len() * 2 * COLOR_STRIDE_BYTES as usize);
+                assert_eq!(ranges.len(), strips.len());
+                assert_eq!(
+                    positions.as_ptr(),
+                    position_ptr,
+                    "a within-bound refresh must never reallocate the staging"
+                );
+                assert_eq!(colors.as_ptr(), color_ptr);
+                for (index, &(start, count)) in ranges.iter().enumerate() {
+                    assert_eq!(
+                        (start, count),
+                        (u32::try_from(index * 2).unwrap(), 2),
+                        "grid segments pack as canonical two-vertex strips"
+                    );
+                }
+                // `update_mesh`'s vertex guard: 2·segments ≤ 2·bound —
+                // proven here at the byte level: every grid output fits the
+                // staging the prebuilt mesh would carry.
+                assert!(positions.len() <= positions.capacity());
+            }
         }
     }
 }
