@@ -1,6 +1,8 @@
 # ui-blueprint — 规格
 
-状态：Draft（草案）
+状态：In Review（评审中）
+
+批准：2026-09-03（负责人无异议，Draft → In Review；批准前置：muda 接线 spike 通过 + macOS 依赖子树许可核验——spike 已列 plan 首任务）
 
 日期：2026-09-02
 
