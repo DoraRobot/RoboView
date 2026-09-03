@@ -240,6 +240,73 @@ pub enum TextKey {
     PathLimit,
     /// OS-level file read failure leaf: `{error}`.
     ReadError,
+    // 004 ui-blueprint copy (docs/specs/004-ui-blueprint/): the four-zone
+    // layout's new surfaces — toolbar & helper-layer toggles, the object
+    // tree (search, context menu), the properties panel, and the status bar.
+    // Toolbar & helper layers (004 spec §6): the toolbar row and the
+    // viewport HUD badges are two doors to the same two toggles and share
+    // one label/tooltip pair per layer.
+    /// Label of the toolbar's Open split button; its dropdown reuses the
+    /// per-family [`TextKey::MenuOpenPointCloud`] labels.
+    ToolOpen,
+    /// Label of the toolbar's Add split button; its entries reuse
+    /// [`TextKey::ObjectsAddFrame`] / [`TextKey::ObjectsAddMarker`].
+    ToolAdd,
+    /// Label of the ground-grid toggle (toolbar button, HUD badge, and any
+    /// menu entry — one state, several doors, 004 spec §6).
+    ToggleGrid,
+    /// Label of the world-origin axes toggle; see [`TextKey::ToggleGrid`].
+    ToggleAxes,
+    /// Tooltip of the ground-grid toggle (both doors, both states).
+    GridToggleTooltip,
+    /// Tooltip of the world-origin axes toggle.
+    AxesToggleTooltip,
+    // Object tree (ui/objects_panel.rs, 004 spec §4 A6/A8): grouped rows,
+    // name search, and the row context menu.
+    /// Placeholder of the tree's search field (filters object names).
+    TreeSearchPlaceholder,
+    /// Empty-filter state of a *searched* tree (no name matches); the empty
+    /// scene keeps [`TextKey::ObjectsEmptyHint`].
+    TreeNoMatchHint,
+    /// Context-menu item that starts renaming the row (an object or a group).
+    ContextRename,
+    /// Context-menu item of a hidden row: make it visible. A menu label
+    /// must follow the row state, so there is one key per direction.
+    ContextShow,
+    /// Context-menu item of a visible row: hide it.
+    ContextHide,
+    /// Tooltip of the per-row visibility switch (the tree's eye column).
+    ContextToggleVisible,
+    /// Context-menu item deleting the row's object.
+    ContextDelete,
+    /// Group-row entry that sets the group's default color (applied to new
+    /// group members only, 004 spec §4 A6/M4 — never a batch recolor).
+    GroupDefaultColor,
+    // Properties panel (ui/properties_panel.rs, 004 spec §4 A3): the
+    // editable row set of the selected object.
+    /// Hint shown while nothing is selected (no object to edit).
+    PropEmptyHint,
+    /// Heading of the geometry card holding the spatial rows (a frame's
+    /// origin, a marker's anchor, an arrow's endpoints).
+    PropGroupTransform,
+    /// Heading of a frame's kind-specific card when its rows (the axis
+    /// length) are split off the geometry card; the per-kind panel heading
+    /// otherwise reuses the [`TextKey::KindFrame`] family of labels.
+    PropGroupFrame,
+    /// Row label of the editable object name.
+    PropLabelName,
+    /// Row label of the visibility switch of the properties panel.
+    PropLabelVisible,
+    /// Row label of the mesh-color field (a color picker row).
+    PropLabelColor,
+    /// Row label of a frame's axis-length value.
+    PropLabelLength,
+    // Status bar (ui/status_bar.rs, 004 spec §4 A7): the bottom segments.
+    /// Segment label of the frames-per-second readout.
+    StatusFps,
+    /// Copy of the loading/tool segment while no load is in flight and no
+    /// hovered widget reports a tooltip.
+    StatusReady,
 }
 
 impl TextKey {
@@ -299,6 +366,29 @@ impl TextKey {
         TextKey::PathTooFewPoints,
         TextKey::PathLimit,
         TextKey::ReadError,
+        TextKey::ToolOpen,
+        TextKey::ToolAdd,
+        TextKey::ToggleGrid,
+        TextKey::ToggleAxes,
+        TextKey::GridToggleTooltip,
+        TextKey::AxesToggleTooltip,
+        TextKey::TreeSearchPlaceholder,
+        TextKey::TreeNoMatchHint,
+        TextKey::ContextRename,
+        TextKey::ContextShow,
+        TextKey::ContextHide,
+        TextKey::ContextToggleVisible,
+        TextKey::ContextDelete,
+        TextKey::GroupDefaultColor,
+        TextKey::PropEmptyHint,
+        TextKey::PropGroupTransform,
+        TextKey::PropGroupFrame,
+        TextKey::PropLabelName,
+        TextKey::PropLabelVisible,
+        TextKey::PropLabelColor,
+        TextKey::PropLabelLength,
+        TextKey::StatusFps,
+        TextKey::StatusReady,
     ];
 }
 
@@ -406,6 +496,42 @@ static EN: &[(TextKey, &str)] = &[
         "The path file exceeds the supported load limits: {reason}",
     ),
     (TextKey::ReadError, "Could not read the file: {error}"),
+    // 004 ui-blueprint copy — toolbar & helper layers (004 spec §6).
+    (TextKey::ToolOpen, "Open…"),
+    (TextKey::ToolAdd, "Add…"),
+    (TextKey::ToggleGrid, "Grid"),
+    (TextKey::ToggleAxes, "Axes"),
+    (
+        TextKey::GridToggleTooltip,
+        "Show or hide the ground grid (Z = 0)",
+    ),
+    (
+        TextKey::AxesToggleTooltip,
+        "Show or hide the axes at the world origin",
+    ),
+    // Object tree — search and row context menu (004 spec §4 A6/A8).
+    (TextKey::TreeSearchPlaceholder, "Search objects"),
+    (TextKey::TreeNoMatchHint, "No objects match the search."),
+    (TextKey::ContextRename, "Rename"),
+    (TextKey::ContextShow, "Show"),
+    (TextKey::ContextHide, "Hide"),
+    (TextKey::ContextToggleVisible, "Toggle visibility"),
+    (TextKey::ContextDelete, "Delete"),
+    (TextKey::GroupDefaultColor, "Default color…"),
+    // Properties panel (004 spec §4 A3).
+    (
+        TextKey::PropEmptyHint,
+        "Select an object in the tree to see and edit its properties.",
+    ),
+    (TextKey::PropGroupTransform, "Transform"),
+    (TextKey::PropGroupFrame, "Frame"),
+    (TextKey::PropLabelName, "Name"),
+    (TextKey::PropLabelVisible, "Visible"),
+    (TextKey::PropLabelColor, "Color"),
+    (TextKey::PropLabelLength, "Length"),
+    // Status bar (004 spec §4 A7).
+    (TextKey::StatusFps, "FPS"),
+    (TextKey::StatusReady, "Ready"),
 ];
 
 /// Simplified-Chinese copy (`zh-CN`), the translation table. Kept key-aligned
@@ -493,6 +619,36 @@ static ZH: &[(TextKey, &str)] = &[
     ),
     (TextKey::PathLimit, "路径文件超出支持的加载上限：{reason}"),
     (TextKey::ReadError, "无法读取文件：{error}"),
+    // 004 ui-blueprint copy — toolbar & helper layers (004 spec §6).
+    (TextKey::ToolOpen, "打开…"),
+    (TextKey::ToolAdd, "添加…"),
+    (TextKey::ToggleGrid, "网格"),
+    (TextKey::ToggleAxes, "轴"),
+    (TextKey::GridToggleTooltip, "显示或隐藏地面网格（Z = 0）"),
+    (TextKey::AxesToggleTooltip, "显示或隐藏世界原点三轴"),
+    // Object tree — search and row context menu (004 spec §4 A6/A8).
+    (TextKey::TreeSearchPlaceholder, "搜索对象"),
+    (TextKey::TreeNoMatchHint, "没有对象匹配当前搜索。"),
+    (TextKey::ContextRename, "重命名"),
+    (TextKey::ContextShow, "显示"),
+    (TextKey::ContextHide, "隐藏"),
+    (TextKey::ContextToggleVisible, "切换显隐"),
+    (TextKey::ContextDelete, "删除"),
+    (TextKey::GroupDefaultColor, "默认颜色…"),
+    // Properties panel (004 spec §4 A3).
+    (
+        TextKey::PropEmptyHint,
+        "在对象树中选择对象，以查看并编辑其属性。",
+    ),
+    (TextKey::PropGroupTransform, "变换"),
+    (TextKey::PropGroupFrame, "坐标架"),
+    (TextKey::PropLabelName, "名称"),
+    (TextKey::PropLabelVisible, "可见"),
+    (TextKey::PropLabelColor, "颜色"),
+    (TextKey::PropLabelLength, "长度"),
+    // Status bar (004 spec §4 A7).
+    (TextKey::StatusFps, "帧率"),
+    (TextKey::StatusReady, "就绪"),
 ];
 
 /// Resolve `key` to the copy of `locale` (spec §6.3). A zh value missing
@@ -883,6 +1039,156 @@ pub fn loader_start_failed(locale: Locale, error: &impl Display) -> String {
         resolve(locale, TextKey::LoaderStartFailed),
         &[("error", &error)],
     )
+}
+
+// 004 ui-blueprint getters: the copy of the toolbar & helper layers, the
+// object tree, the properties panel, and the status bar (004 spec §4 A3–A8
+// / §6). The 004 implementers consume these over waves W4–W6 (tree, viewport
+// overlays, properties panel, status bar); until then every getter carries
+// an `#[allow(dead_code)]` — inert once a consumer calls the getter, drop it
+// on any later touch of this section.
+
+/// Label of the toolbar's Open split button (its dropdown reuses the
+/// per-family `menu_open_*` getters).
+#[allow(dead_code)]
+pub fn tool_open(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::ToolOpen)
+}
+
+/// Label of the toolbar's Add split button (its entries reuse
+/// `objects_add_frame`/`objects_add_marker`).
+#[allow(dead_code)]
+pub fn tool_add(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::ToolAdd)
+}
+
+/// Label of the ground-grid toggle (toolbar button, HUD badge, menu entry).
+#[allow(dead_code)]
+pub fn toggle_grid(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::ToggleGrid)
+}
+
+/// Label of the world-origin axes toggle; see [`toggle_grid`].
+#[allow(dead_code)]
+pub fn toggle_axes(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::ToggleAxes)
+}
+
+/// Tooltip of the ground-grid toggle (both doors, both states).
+#[allow(dead_code)]
+pub fn grid_toggle_tooltip(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::GridToggleTooltip)
+}
+
+/// Tooltip of the world-origin axes toggle.
+#[allow(dead_code)]
+pub fn axes_toggle_tooltip(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::AxesToggleTooltip)
+}
+
+/// Placeholder of the tree's search field (filters object names).
+#[allow(dead_code)]
+pub fn tree_search_placeholder(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::TreeSearchPlaceholder)
+}
+
+/// Empty-filter state of a searched tree (no name matches).
+#[allow(dead_code)]
+pub fn tree_no_match_hint(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::TreeNoMatchHint)
+}
+
+/// Context-menu item that starts renaming the row (an object or a group).
+#[allow(dead_code)]
+pub fn context_rename(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::ContextRename)
+}
+
+/// Context-menu item of a hidden row: make it visible.
+#[allow(dead_code)]
+pub fn context_show(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::ContextShow)
+}
+
+/// Context-menu item of a visible row: hide it.
+#[allow(dead_code)]
+pub fn context_hide(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::ContextHide)
+}
+
+/// Tooltip of the per-row visibility switch (the tree's eye column).
+#[allow(dead_code)]
+pub fn context_toggle_visible(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::ContextToggleVisible)
+}
+
+/// Context-menu item deleting the row's object.
+#[allow(dead_code)]
+pub fn context_delete(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::ContextDelete)
+}
+
+/// Group-row entry that sets the group's default color (new members only).
+#[allow(dead_code)]
+pub fn group_default_color(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::GroupDefaultColor)
+}
+
+/// Hint of the properties panel while nothing is selected.
+#[allow(dead_code)]
+pub fn prop_empty_hint(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::PropEmptyHint)
+}
+
+/// Heading of the properties panel's geometry card (spatial rows).
+#[allow(dead_code)]
+pub fn prop_group_transform(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::PropGroupTransform)
+}
+
+/// Heading of a frame's kind-specific card when its rows are split off the
+/// geometry card; per-kind panel headings otherwise reuse
+/// `object_kind_label`.
+#[allow(dead_code)]
+pub fn prop_group_frame(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::PropGroupFrame)
+}
+
+/// Row label of the editable object name.
+#[allow(dead_code)]
+pub fn prop_label_name(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::PropLabelName)
+}
+
+/// Row label of the visibility switch of the properties panel.
+#[allow(dead_code)]
+pub fn prop_label_visible(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::PropLabelVisible)
+}
+
+/// Row label of the mesh-color field (a color picker row).
+#[allow(dead_code)]
+pub fn prop_label_color(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::PropLabelColor)
+}
+
+/// Row label of a frame's axis-length value.
+#[allow(dead_code)]
+pub fn prop_label_length(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::PropLabelLength)
+}
+
+/// Segment label of the frames-per-second readout.
+#[allow(dead_code)]
+pub fn status_fps(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::StatusFps)
+}
+
+/// Copy of the loading/tool segment while nothing loads and no tooltip is
+/// hovered.
+#[allow(dead_code)]
+pub fn status_ready(locale: Locale) -> &'static str {
+    resolve(locale, TextKey::StatusReady)
 }
 
 #[cfg(test)]
