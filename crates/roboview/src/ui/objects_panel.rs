@@ -1,14 +1,15 @@
 //! The fixed objects sidebar (display-types plan §3.4): the type-grouped
-//! object tree (004 spec §6, A6) and the two non-modal add dialogs it
-//! opens.
+//! object tree (004 spec §6, A6) and the inline Add frame/marker forms it
+//! expands under the action row (004 spec A5 — the floating Add windows of
+//! the 002 era are gone, M3).
 //!
 //! Panel layout:
 //!
 //! - the heading;
 //! - the action row: the **Fit** control (display-types spec §6: reframe
 //!   the camera to the union of the measurable objects — disabled while
-//!   nothing measurable is visible) and the two **Add…** entries that open
-//!   the dialogs below;
+//!   nothing measurable is visible) and the two **Add** entries, which
+//!   expand (and, re-clicked, collapse) the inline form below the row;
 //! - the search field (004 spec §6 A6): filters member rows by name
 //!   substring, case-insensitive;
 //! - the tree: rows grouped by display type (point cloud / mesh / path /
@@ -35,39 +36,48 @@
 //!   search field.
 //!
 //! Session state (search text, collapsed groups, group colors, selection,
-//! the pending rename) lives in [`ObjectsPanelState`], which the caller
-//! owns across frames. The scene itself stays read-only for the panel
-//! body: rows are snapshotted once at the top and the requested mutations
-//! come back as [`TreeAction`]s for the caller to apply under its scene
-//! lock — so the panel never holds the lock while laying out widgets.
-//! Actions are id-based and the scene never reuses ids, so an action for
-//! an object removed meanwhile is a safe no-op.
+//! the pending rename, the open inline add form) lives in
+//! [`ObjectsPanelState`], which the caller owns across frames. The scene
+//! itself stays read-only for the panel body: rows are snapshotted once at
+//! the top and the requested mutations — the [`TreeAction`]s and the
+//! commits of the inline add forms — come back in the
+//! [`ObjectsPanelOutput`] for the caller to apply under its scene lock, so
+//! the panel never holds the lock while laying out widgets. Actions are
+//! id-based and the scene never reuses ids, so an action for an object
+//! removed meanwhile is a safe no-op.
 //!
 //! One entry: [`ui`] takes the app-owned [`ObjectsPanelState`] and returns
-//! the [`ObjectsPanelOutput`] (tree actions + dialog-open requests) for the
-//! caller (main.rs) to apply under its scene lock.
+//! the [`ObjectsPanelOutput`] (tree actions + committed inline adds + the
+//! camera reframe) for the caller (main.rs) to apply under its scene lock.
 //!
-//! The add dialogs are unchanged from the flat-list era (they are removed
-//! by T17, A11, when the Add entries move into the toolbar): frame
-//! (origin + axis length) and marker (text label or arrow) open non-modally
-//! next to the panel (display-types spec §7 F3/F4) with defaults derived
-//! from the visible scene bounds ([`ViewportState::ui_defaults`]). All copy
-//! lives in `texts.rs`; every entry point takes the current [`Locale`]
-//! (003 spec §6.2: explicit injection) and reads its copy through
-//! `texts::…(locale)`.
+//! The two Add entries of the action row are the 004 spec A5 doors: no
+//! floating Add window exists anywhere (M3 — the 002 dialogs left with
+//! T17). A click expands a small inline form beneath the row — one form at
+//! a time, frame (origin + axis length) or marker (text label / arrow
+//! radio with its parameters) — whose fields are seeded on open from the
+//! visible scene bounds, exactly the defaults the dialogs' `open(center,
+//! scale)` received from the viewport (`ui_defaults` of `viewport.rs`:
+//! bounds center, axis length a quarter of the largest dimension, arrow
+//! tip a fifth along +X). The Add button or Enter commits the draft
+//! through the output and the caller adds under the viewport lock through
+//! `ViewportState::add_frame`/`add_marker` (generated names, default
+//! colors; inheriting the group default colors at add time is the T16
+//! wiring, D4). Escape or a re-click of the open entry closes the form
+//! without adding. All copy lives in `texts.rs`; every entry point takes
+//! the current [`Locale`] (003 spec §6.2: explicit injection) and reads
+//! its copy through `texts::…(locale)`.
 //!
 //! The scene lock is the same single uncontended lock the viewport panel
-//! uses ([`viewport::lock_state`]): the panel and dialogs run on the UI
-//! thread and briefly lock per action, never while painting.
-
-use std::sync::{Arc, Mutex};
+//! uses (`viewport::lock_state`): the panel never locks while painting —
+//! the caller applies every mutation (tree actions and inline adds alike)
+//! after the panel pass, under the lock and never while painting.
 
 use eframe::egui;
 use eframe::egui::widgets::color_picker::color_edit_button_srgb;
 use glam::Vec3;
 
 use roboview_core::displays::{DisplayKind, DisplayObject, Marker};
-use roboview_core::io::Color;
+use roboview_core::io::{Aabb, Color};
 use roboview_core::scene::Scene;
 
 #[cfg(test)]
@@ -75,7 +85,6 @@ use roboview_core::scene::camera::OrbitCamera;
 
 use super::texts::{self, Locale};
 use super::theme::{SELECT_HIGHLIGHT, to_color32};
-use super::viewport::{self, ViewportState};
 
 /// Height of every tree row (group headers and members alike).
 const ROW_HEIGHT: f32 = 22.0;
@@ -118,11 +127,11 @@ pub enum TreeAction {
     Delete(u64),
 }
 
-/// Panel output of the tree body: the mutations the caller should apply to
-/// the live scene, plus the requests the caller owns (the dialogs and the
-/// camera reframe) — everything the panel itself cannot do with its
-/// read-only scene snapshot.
-#[derive(Debug, Default)]
+/// Panel output of the panel body: the mutations the caller should apply to
+/// the live scene — the tree actions and the commits of the inline add
+/// forms — plus the camera reframe request; everything the panel itself
+/// cannot do with its read-only scene snapshot.
+#[derive(Default)]
 pub struct ObjectsPanelOutput {
     /// Tree actions to apply to the scene, in the order the panel queued
     /// them (see [`apply_actions`]).
@@ -130,10 +139,16 @@ pub struct ObjectsPanelOutput {
     /// The Fit button was clicked: reframe the camera to the union of the
     /// measurable objects (`OrbitCamera::framing(bounds_union().as_ref())`).
     pub fit: bool,
-    /// The Add frame entry was clicked (opens the dialog in the caller).
-    pub open_add_frame: bool,
-    /// The Add marker entry was clicked (opens the dialog in the caller).
-    pub open_add_marker: bool,
+    /// The inline Add frame form committed (its Add button or Enter): the
+    /// caller adds the frame under its scene lock
+    /// (`viewport::ViewportState::add_frame` — generated name, GPU upload
+    /// through the line pipeline). The form closed with the commit.
+    pub add_frame: Option<(Vec3, f32)>,
+    /// The inline Add marker form committed (its Add button or Enter): the
+    /// caller adds the marker under its scene lock
+    /// (`viewport::ViewportState::add_marker`). The form stays open for
+    /// repeat adds.
+    pub add_marker: Option<Marker>,
 }
 
 /// Session state of the objects tree, owned by the caller across frames
@@ -165,6 +180,17 @@ pub struct ObjectsPanelState {
     /// The next drawn rename editor should request keyboard focus (set by
     /// [`ObjectsPanelState::begin_rename`], consumed by the row painter).
     rename_focus_pending: bool,
+    /// The open inline Add form (004 spec A5), if any: the draft of the
+    /// frame or marker form currently expanded under the action row.
+    add_draft: Option<AddDraft>,
+    /// The next drawn marker text field should request keyboard focus (set
+    /// by [`ObjectsPanelState::open_add_marker`] and by the shape radio
+    /// when switching back to the text label, consumed by `add_form_ui`).
+    add_focus_pending: bool,
+    /// Enter was held at the end of the previous panel frame: the
+    /// key-repeat latch of the inline form's Enter-to-add (a held Enter
+    /// commits once, not once per OS key repeat).
+    enter_down: bool,
 }
 
 /// Default group color shown (and seeded into the picker) while the group
@@ -252,6 +278,94 @@ impl ObjectsPanelState {
     }
 }
 
+impl ObjectsPanelState {
+    // — Inline Add forms (004 spec A5; the 002 §7 F3/F4 add doors) —
+
+    /// Open the inline Add frame form under the action row, seeding its
+    /// draft from the visible-scene defaults the caller derived ([`add_defaults`]
+    /// mirrors the viewport's `ui_defaults`: origin at the bounds center,
+    /// axis length a quarter of the largest dimension). Replaces any open
+    /// form — one form at a time. Both doors land here: the panel's own
+    /// action row and the caller's shared Add action (main.rs dispatch).
+    pub fn open_add_frame(&mut self, center: Vec3, scale: f32) {
+        self.add_draft = Some(AddDraft::Frame(FrameDraft {
+            origin: center,
+            length: (scale * 0.25).max(1e-4),
+            speed: drag_speed(scale),
+        }));
+        self.add_focus_pending = false;
+    }
+
+    /// Open the inline Add marker form under the action row, seeding its
+    /// draft with the dialog defaults: the text-label shape, its anchor at
+    /// the bounds center, empty label text, and the arrow's tail at the
+    /// center with its tip a fifth of the largest dimension along +X.
+    /// Replaces any open form and requests keyboard focus in the text
+    /// field. Same doors as [`ObjectsPanelState::open_add_frame`].
+    pub fn open_add_marker(&mut self, center: Vec3, scale: f32) {
+        self.add_draft = Some(AddDraft::Marker(MarkerDraft {
+            shape: MarkerShape::Text,
+            anchor: center,
+            text: String::new(),
+            start: center,
+            end: center + Vec3::X * (scale * 0.2).max(1e-4),
+            speed: drag_speed(scale),
+        }));
+        self.add_focus_pending = true;
+    }
+
+    /// Close the inline add form, discarding its draft without adding
+    /// (re-clicking the open action-row entry and Escape both land here).
+    pub fn close_add(&mut self) {
+        self.add_draft = None;
+        self.add_focus_pending = false;
+    }
+
+    /// Commit the open frame form (its Add button or Enter). Returns the
+    /// (origin, length) the caller adds under its scene lock and closes
+    /// the form — a frame add is a one-shot placement, like the dialog it
+    /// replaces. `None` while no frame form is open.
+    fn commit_add_frame(&mut self) -> Option<(Vec3, f32)> {
+        let draft = self.add_draft.as_mut()?;
+        let AddDraft::Frame(frame) = draft else {
+            return None;
+        };
+        let add = (frame.origin, frame.length);
+        self.add_draft = None;
+        Some(add)
+    }
+
+    /// Commit the open marker form (its Add button or Enter). Returns the
+    /// marker the caller adds under its scene lock. A text label must
+    /// carry actual text — an empty label would be invisible in the
+    /// viewport and uneditable in the scene (display-types spec §5
+    /// non-goal), so an empty-text commit is refused and the form stays
+    /// open for typing. The form stays open after a commit for repeat
+    /// adds, and a committed label clears its text field for the next
+    /// entry (the dialog's semantics). `None` while no marker form is
+    /// open.
+    fn commit_add_marker(&mut self) -> Option<Marker> {
+        let draft = self.add_draft.as_mut()?;
+        let AddDraft::Marker(marker) = draft else {
+            return None;
+        };
+        let marker_out = match marker.shape {
+            MarkerShape::Text => {
+                let text = marker.text.trim().to_owned();
+                if text.is_empty() {
+                    return None;
+                }
+                Marker::text(marker.anchor, text)
+            }
+            MarkerShape::Arrow => Marker::arrow(marker.start, marker.end),
+        };
+        if marker.shape == MarkerShape::Text {
+            marker.text.clear();
+        }
+        Some(marker_out)
+    }
+}
+
 /// Apply panel actions to the live scene. Every action is id-based, so
 /// applying an action for an object that vanished meanwhile is a safe
 /// no-op (the scene APIs report the miss). Callers hold their scene lock
@@ -276,8 +390,8 @@ pub fn apply_actions(scene: &mut Scene<DisplayObject>, actions: &[TreeAction]) {
 
 /// Draw the objects sidebar into `ui` (used inside the left
 /// [`egui::SidePanel`]) with the app-owned tree state. Returns the panel
-/// output for the caller to apply: the tree actions under its scene lock,
-/// plus the Fit/dialog requests it owns (see module docs).
+/// output for the caller to apply under its scene lock: the tree actions,
+/// the Fit request, and the committed inline adds (see module docs).
 pub fn ui(
     ui: &mut egui::Ui,
     state: &mut ObjectsPanelState,
@@ -287,19 +401,32 @@ pub fn ui(
     let rows = rows_from_scene(scene);
     // The Fit enablement is a scene read (bounds union over the measurable
     // objects); the reframe itself is a camera mutation the caller applies.
-    let can_fit = scene.bounds_union().is_some();
+    // The same union seeds the inline add forms' defaults (see
+    // [`add_defaults`]).
+    let bounds = scene.bounds_union();
+    let can_fit = bounds.is_some();
     let mut output = ObjectsPanelOutput::default();
-    panel_body(ui, state, &rows, can_fit, locale, &mut output);
+    panel_body(
+        ui,
+        state,
+        &rows,
+        can_fit,
+        add_defaults(bounds),
+        locale,
+        &mut output,
+    );
     output
 }
 
-/// The shared panel chrome and tree body of both entries: heading, action
-/// row, search field, and the grouped tree (or its hints).
+/// The shared panel chrome and tree body: the heading, the action row, the
+/// inline Add form while one is open, the search field, and the grouped
+/// tree (or its hints).
 fn panel_body(
     ui: &mut egui::Ui,
     state: &mut ObjectsPanelState,
     rows: &[Row],
     can_fit: bool,
+    defaults: (Vec3, f32),
     locale: Locale,
     output: &mut ObjectsPanelOutput,
 ) {
@@ -307,7 +434,9 @@ fn panel_body(
     ui.heading(texts::objects_panel_title(locale));
 
     // Action row: Fit + the two UI-add entries. Wrapped so a narrow panel
-    // folds the buttons instead of clipping them.
+    // folds the buttons instead of clipping them. The Add entries toggle
+    // their inline form (004 spec A5): opening one kind replaces the other
+    // and re-clicking the open entry closes the form again.
     ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -321,16 +450,41 @@ fn panel_body(
         {
             output.fit = true;
         }
-        if ui.button(texts::objects_add_frame(locale)).clicked() {
-            output.open_add_frame = true;
+        let frame_open = matches!(state.add_draft, Some(AddDraft::Frame(_)));
+        if ui
+            .add(egui::Button::new(texts::objects_add_frame(locale)).selected(frame_open))
+            .clicked()
+        {
+            if frame_open {
+                state.close_add();
+            } else {
+                state.open_add_frame(defaults.0, defaults.1);
+            }
         }
-        if ui.button(texts::objects_add_marker(locale)).clicked() {
-            output.open_add_marker = true;
+        let marker_open = matches!(state.add_draft, Some(AddDraft::Marker(_)));
+        if ui
+            .add(egui::Button::new(texts::objects_add_marker(locale)).selected(marker_open))
+            .clicked()
+        {
+            if marker_open {
+                state.close_add();
+            } else {
+                state.open_add_marker(defaults.0, defaults.1);
+            }
         }
     });
 
+    if state.add_draft.is_some() {
+        ui.add_space(6.0);
+        add_form_ui(ui, state, locale, output);
+    }
     ui.add_space(6.0);
     tree_section(ui, state, rows, locale, output);
+
+    // Refresh the Enter key-repeat latch of the inline form's Enter-to-add
+    // every frame — also while no form is open, so a held Enter never
+    // leaks into a form opened mid-hold.
+    state.enter_down = ui.input(|i| i.key_down(egui::Key::Enter));
 }
 
 /// The search field and the grouped tree (or the empty / no-match hints).
@@ -753,226 +907,277 @@ fn matches_query(filter: &str, name: &str) -> bool {
     name.to_lowercase().contains(&filter.to_lowercase())
 }
 
-// Reserved legacy dialog types below: unchanged from the flat-list era.
-
-/// Non-modal Add frame dialog (display-types spec §7 F3): origin + axis
-/// length, then "Add" uploads the frame through the line pipeline and
-/// appends it to the scene under a generated name. Adding closes the window
-/// — a frame is a one-shot placement, unlike the marker dialog which stays
-/// open for repeat adds.
-pub struct AddFrameDialog {
-    open: bool,
-    origin: Vec3,
-    length: f32,
-    /// Drag step of every DragValue, matched to the scene scale at open
-    /// time (see [`drag_speed`]).
-    speed: f32,
-}
-
-impl AddFrameDialog {
-    pub fn new() -> Self {
-        Self {
-            open: false,
-            origin: Vec3::ZERO,
-            length: 1.0,
-            speed: 0.05,
-        }
-    }
-
-    /// Open the dialog with defaults derived from the visible scene
-    /// (center of the bounds union, axis length a quarter of its largest
-    /// dimension).
-    pub fn open(&mut self, center: Vec3, scale: f32) {
-        self.open = true;
-        self.origin = center;
-        self.length = (scale * 0.25).max(1e-4);
-        self.speed = drag_speed(scale);
-    }
-
-    pub fn show(&mut self, ctx: &egui::Context, state: &Arc<Mutex<ViewportState>>, locale: Locale) {
-        if !self.open {
-            return;
-        }
-        let mut add = false;
-        egui::Window::new(texts::add_frame_window_title(locale))
-            .id(egui::Id::new("add_frame_dialog"))
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut self.open)
-            .show(ctx, |ui| {
-                xyz_row(
-                    ui,
-                    texts::add_frame_origin(locale),
-                    &mut self.origin,
-                    self.speed,
-                );
-                ui.horizontal(|ui| {
-                    ui.label(texts::add_frame_length(locale));
-                    // Negative or zero lengths draw no geometry in the line
-                    // pipeline, so clamp the axis length to positive values.
-                    ui.add(
-                        egui::DragValue::new(&mut self.length)
-                            .speed(self.speed)
-                            .range(0.0..=f32::MAX),
-                    );
-                });
-                // The confirm button, pinned right of the window.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(texts::add_object_button(locale)).clicked() {
-                        add = true;
-                    }
-                });
-            });
-        if add {
-            viewport::lock_state(state).add_frame(self.origin, self.length);
-            self.open = false;
-        }
-    }
-}
-
-impl Default for AddFrameDialog {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// The chosen marker shape (display-types spec §7 F4): a viewport overlay
-/// text label or a 3D arrow with a head.
+/// The chosen marker shape of the inline Add marker form (display-types
+/// spec §7 F4): a viewport overlay text label or a 3D arrow with a head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MarkerShape {
     Text,
     Arrow,
 }
 
-/// Non-modal Add marker dialog (display-types spec §7 F4): one shape radio
-/// (text label / arrow), shape-specific parameter rows, and "Add" — which
-/// appends the marker under a generated name and stays open (closing via
-/// the window button), so several markers can be placed in one session.
-/// Adding a text label clears its text field for the next entry.
-pub struct AddMarkerDialog {
-    open: bool,
-    shape: MarkerShape,
-    anchor: Vec3,
-    text: String,
-    start: Vec3,
-    end: Vec3,
+/// Draft parameters of the inline frame form (004 spec A5).
+#[derive(Debug, Clone, PartialEq)]
+struct FrameDraft {
+    /// Frame origin (three XYZ drag values).
+    origin: Vec3,
+    /// Axis length (non-negative; zero or negative lengths draw no
+    /// geometry in the line pipeline).
+    length: f32,
+    /// Drag step of every DragValue, matched to the scene scale at open
+    /// time (see [`drag_speed`]).
     speed: f32,
 }
 
-impl AddMarkerDialog {
-    pub fn new() -> Self {
-        Self {
-            open: false,
-            shape: MarkerShape::Text,
-            anchor: Vec3::ZERO,
-            text: String::new(),
-            start: Vec3::ZERO,
-            end: Vec3::X,
-            speed: 0.05,
-        }
-    }
+/// Draft parameters of the inline marker form (004 spec A5).
+#[derive(Debug, Clone, PartialEq)]
+struct MarkerDraft {
+    /// Chosen shape (text label or arrow).
+    shape: MarkerShape,
+    /// Anchor of the text label (its world point).
+    anchor: Vec3,
+    /// Label text, committed trimmed and non-empty (an empty label would
+    /// be invisible, display-types spec §5 non-goal).
+    text: String,
+    /// Arrow tail.
+    start: Vec3,
+    /// Arrow tip.
+    end: Vec3,
+    /// Drag step of every DragValue, matched to the scene scale at open
+    /// time (see [`drag_speed`]).
+    speed: f32,
+}
 
-    /// Open the dialog with defaults derived from the visible scene: the
-    /// text anchor and the arrow tail at the bounds center, the arrow tip
-    /// a fifth of the largest dimension along +X.
-    pub fn open(&mut self, center: Vec3, scale: f32) {
-        self.open = true;
-        self.shape = MarkerShape::Text;
-        self.anchor = center;
-        self.text.clear();
-        self.start = center;
-        self.end = center + Vec3::X * (scale * 0.2).max(1e-4);
-        self.speed = drag_speed(scale);
-    }
+/// The draft of the open inline Add form: the editable parameters of the
+/// frame or marker form expanded under the action row. Seeded on open from
+/// the visible-scene defaults ([`add_defaults`], the dialog-era `open`
+/// semantics); the Add button or Enter commits it through the output,
+/// Escape or a re-click of the open entry discards it.
+#[derive(Debug, Clone, PartialEq)]
+enum AddDraft {
+    /// A coordinate frame: origin plus axis length.
+    Frame(FrameDraft),
+    /// A marker: the shape radio plus the shape's parameters.
+    Marker(MarkerDraft),
+}
 
-    pub fn show(&mut self, ctx: &egui::Context, state: &Arc<Mutex<ViewportState>>, locale: Locale) {
-        if !self.open {
-            return;
-        }
-        let mut add = false;
-        egui::Window::new(texts::add_marker_window_title(locale))
-            .id(egui::Id::new("add_marker_dialog"))
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut self.open)
-            .show(ctx, |ui| {
+/// Fallback scene scale the inline add defaults use while the scene holds
+/// nothing measurable: the mirror of `viewport.rs`'s private
+/// `DEFAULT_UI_SCALE`, the value the removed dialogs received from the
+/// viewport's `ui_defaults` on an empty or frame/marker-only scene. The
+/// pairing keeps the empty-scene add defaults (world origin, frame axis
+/// length 2.5) identical to the dialog era.
+const ADD_UI_SCALE_FALLBACK: f32 = 10.0;
+
+/// The (center, scale) pair the inline add forms seed their fields from on
+/// open: the center and largest dimension of the visible bounds union, or
+/// the origin/fallback-scale pair when the scene holds nothing measurable.
+/// Mirrors the viewport's `ui_defaults` — same input (the same live scene
+/// snapshot) and same outputs — so a form can be seeded in the same frame
+/// its entry opens, without the panel touching the viewport lock.
+fn add_defaults(bounds: Option<Aabb>) -> (Vec3, f32) {
+    let Some(bounds) = bounds else {
+        return (Vec3::ZERO, ADD_UI_SCALE_FALLBACK);
+    };
+    let extent = bounds.largest_dimension();
+    if !extent.is_finite() || extent <= 0.0 {
+        // Degenerate union (a single-point cloud): frame its center at the
+        // fallback scale, like the viewport's own `ui_defaults`.
+        (bounds.center(), ADD_UI_SCALE_FALLBACK)
+    } else {
+        (bounds.center(), extent)
+    }
+}
+
+/// The inline Add form under the action row (004 spec A5): the parameter
+/// rows of the open draft and its commit affordances, drawn only while
+/// `ObjectsPanelState::add_draft` is open. The Add button and Enter commit
+/// the draft into `output` (`add_frame`/`add_marker`, for the caller to
+/// add under its scene lock); Escape and re-clicking the open entry close
+/// the form without adding.
+///
+/// Enter-to-add is gated so the panel never steals the keys of another
+/// text input: while any widget outside the form holds the keyboard (the
+/// tree's search or rename editors, a properties-panel field), Enter and
+/// Escape stay with that widget — the form's own label field counts as the
+/// form. A held Enter commits once: `ObjectsPanelState::enter_down` is the
+/// key-repeat latch, refreshed every frame at the end of [`panel_body`].
+fn add_form_ui(
+    ui: &mut egui::Ui,
+    state: &mut ObjectsPanelState,
+    locale: Locale,
+    output: &mut ObjectsPanelOutput,
+) {
+    let enter_down = ui.input(|i| i.key_down(egui::Key::Enter));
+    let enter_pressed = enter_down && !state.enter_down;
+    let focus_pending = std::mem::take(&mut state.add_focus_pending);
+
+    let kind_is_frame = matches!(state.add_draft, Some(AddDraft::Frame(_)));
+    let title = if kind_is_frame {
+        texts::add_frame_window_title(locale)
+    } else {
+        texts::add_marker_window_title(locale)
+    };
+
+    let mut submit = false;
+    let mut close = false;
+    let mut refocus_text = false;
+    let mut text_has_focus = false;
+    let mut text_field: Option<egui::Response> = None;
+
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.label(egui::RichText::new(title).strong());
+        ui.add_space(4.0);
+
+        let mut shape_is_text = false;
+        let mut text_empty = false;
+        match state.add_draft.as_mut() {
+            Some(AddDraft::Frame(frame)) => {
+                xyz_row(
+                    ui,
+                    texts::add_frame_origin(locale),
+                    &mut frame.origin,
+                    frame.speed,
+                );
                 ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.shape,
-                        MarkerShape::Text,
-                        texts::marker_shape_text(locale),
+                    ui.label(texts::add_frame_length(locale));
+                    // Negative or zero lengths draw no geometry in the line
+                    // pipeline, so the drag clamps to non-negative values —
+                    // the removed dialog's rule, unchanged.
+                    ui.add(
+                        egui::DragValue::new(&mut frame.length)
+                            .speed(frame.speed)
+                            .range(0.0..=f32::MAX),
                     );
+                });
+            }
+            Some(AddDraft::Marker(marker)) => {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .selectable_value(
+                            &mut marker.shape,
+                            MarkerShape::Text,
+                            texts::marker_shape_text(locale),
+                        )
+                        .clicked()
+                    {
+                        // Back on the text shape: pull keyboard focus into
+                        // the label field for typing.
+                        state.add_focus_pending = true;
+                    }
                     ui.selectable_value(
-                        &mut self.shape,
+                        &mut marker.shape,
                         MarkerShape::Arrow,
                         texts::marker_shape_arrow(locale),
                     );
                 });
                 ui.add_space(4.0);
-                match self.shape {
+                match marker.shape {
                     MarkerShape::Text => {
+                        shape_is_text = true;
+                        text_empty = marker.text.trim().is_empty();
                         xyz_row(
                             ui,
                             texts::marker_anchor(locale),
-                            &mut self.anchor,
-                            self.speed,
+                            &mut marker.anchor,
+                            marker.speed,
                         );
                         ui.horizontal(|ui| {
                             ui.label(texts::marker_text(locale));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.text)
+                            let edit = ui.add(
+                                egui::TextEdit::singleline(&mut marker.text)
                                     .hint_text(texts::marker_text_hint(locale))
-                                    .desired_width(180.0),
+                                    .desired_width(f32::INFINITY),
                             );
+                            if std::mem::take(&mut state.add_focus_pending) || focus_pending {
+                                edit.request_focus();
+                            }
+                            text_field = Some(edit);
                         });
                     }
                     MarkerShape::Arrow => {
-                        xyz_row(ui, texts::marker_start(locale), &mut self.start, self.speed);
-                        xyz_row(ui, texts::marker_end(locale), &mut self.end, self.speed);
+                        xyz_row(
+                            ui,
+                            texts::marker_start(locale),
+                            &mut marker.start,
+                            marker.speed,
+                        );
+                        xyz_row(ui, texts::marker_end(locale), &mut marker.end, marker.speed);
                     }
                 }
-                // A text label with empty text would be invisible in the
-                // viewport (and uneditable in the scene, display-types spec
-                // §5 non-goal), so Add waits for actual text.
-                let has_label_text =
-                    self.shape != MarkerShape::Text || !self.text.trim().is_empty();
-                ui.add_space(4.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            has_label_text,
-                            egui::Button::new(texts::add_object_button(locale)),
-                        )
-                        .clicked()
-                    {
-                        add = true;
-                    }
-                });
-            });
-        if add {
-            let marker = match self.shape {
-                MarkerShape::Text => Marker::text(self.anchor, self.text.trim().to_owned()),
-                MarkerShape::Arrow => Marker::arrow(self.start, self.end),
-            };
-            viewport::lock_state(state).add_marker(marker);
-            if self.shape == MarkerShape::Text {
-                self.text.clear();
             }
+            None => {}
+        }
+
+        text_has_focus = text_field.as_ref().is_some_and(egui::Response::has_focus);
+        // Enter and Escape belong to the form unless an outside widget
+        // holds the keyboard; the form's own label field is the form.
+        let outside_takes_keys = ui.ctx().wants_keyboard_input() && !text_has_focus;
+        let can_submit = kind_is_frame || !shape_is_text || !text_empty;
+
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) && !outside_takes_keys {
+            close = true;
+        }
+
+        ui.add_space(4.0);
+        // The confirm button, pinned right of the card. A text label with
+        // empty text would be invisible in the viewport (and uneditable in
+        // the scene, display-types spec §5 non-goal), so its commit waits
+        // for actual text — the removed dialog's rule, unchanged.
+        let mut add_clicked = false;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            add_clicked = ui
+                .add_enabled(
+                    can_submit,
+                    egui::Button::new(texts::add_object_button(locale)),
+                )
+                .clicked();
+        });
+        if add_clicked || (enter_pressed && !outside_takes_keys && can_submit) {
+            submit = true;
+        }
+        // A keyboard commit — or an Enter that found nothing to commit on
+        // the text shape — pulls focus back into the label field for the
+        // next entry.
+        if shape_is_text
+            && !outside_takes_keys
+            && (enter_pressed || (add_clicked && text_has_focus))
+        {
+            refocus_text = true;
+        }
+    });
+
+    if close {
+        // The focused widget will not be drawn next frame; egui drops its
+        // focus then, but surrendering here also ends any in-flight edit.
+        if let Some(edit) = &text_field {
+            if edit.has_focus() {
+                edit.surrender_focus();
+            }
+        }
+        state.close_add();
+    }
+    if submit {
+        if kind_is_frame {
+            if let Some(add) = state.commit_add_frame() {
+                output.add_frame = Some(add);
+            }
+        } else if let Some(add) = state.commit_add_marker() {
+            output.add_marker = Some(add);
+        }
+    }
+    if refocus_text {
+        if let Some(edit) = text_field {
+            edit.request_focus();
         }
     }
 }
 
-impl Default for AddMarkerDialog {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// One parameter row: a row label, then the three XYZ drag values prefixed
-/// by their axis letters (texts.rs). Every value drags at `speed` units
-/// per point.
+/// One parameter row of an inline add form: the row label, then the three
+/// XYZ drag values, each prefixed by its axis letter (texts.rs). Wrapped
+/// so a narrow sidebar folds the row instead of clipping it; every value
+/// drags at `speed` units per point.
 fn xyz_row(ui: &mut egui::Ui, label: &str, value: &mut Vec3, speed: f32) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(label);
         axis_drag(ui, texts::AXIS_X, &mut value.x, speed);
         axis_drag(ui, texts::AXIS_Y, &mut value.y, speed);
@@ -981,9 +1186,9 @@ fn xyz_row(ui: &mut egui::Ui, label: &str, value: &mut Vec3, speed: f32) {
 }
 
 fn axis_drag(ui: &mut egui::Ui, axis: &str, value: &mut f32, speed: f32) {
-    let axis_color = ui.visuals().weak_text_color();
-    ui.label(egui::RichText::new(axis).color(axis_color));
-    ui.add(egui::DragValue::new(value).speed(speed));
+    // The axis letter rides inside the drag value so a wrapped row never
+    // splits a letter from its value.
+    ui.add(egui::DragValue::new(value).speed(speed).prefix(axis));
 }
 
 /// Drag step matched to the scene scale: roughly `scale / 500` per drag
@@ -1253,5 +1458,211 @@ mod tests {
         assert_eq!(scene.get(rows[1].id).unwrap().name, "renamed");
         assert!(scene.get(rows[2].id).is_none());
         assert_eq!(rows_from_scene(&scene).len(), 2);
+    }
+
+    // — Inline Add forms (004 spec A5) —
+
+    #[test]
+    fn add_defaults_mirrors_viewport_ui_defaults() {
+        // Nothing measurable: the world origin at the fallback scale — the
+        // viewport's `DEFAULT_UI_SCALE` mirror, the defaults the removed
+        // dialogs received for an empty or frame/marker-only scene.
+        assert_eq!(add_defaults(None), (Vec3::ZERO, ADD_UI_SCALE_FALLBACK));
+
+        // A degenerate union (a single-point cloud) frames the point's
+        // center at the fallback scale, like the viewport's own fallback.
+        let point = Aabb {
+            min: Vec3::new(1.0, -2.0, 3.0),
+            max: Vec3::new(1.0, -2.0, 3.0),
+        };
+        assert_eq!(
+            add_defaults(Some(point)),
+            (Vec3::new(1.0, -2.0, 3.0), ADD_UI_SCALE_FALLBACK)
+        );
+
+        // A measurable union: the center plus its largest dimension.
+        let boxed = Aabb {
+            min: Vec3::ZERO,
+            max: Vec3::new(1.0, 0.5, 0.25),
+        };
+        assert_eq!(
+            add_defaults(Some(boxed)),
+            (Vec3::new(0.5, 0.25, 0.125), 1.0)
+        );
+    }
+
+    #[test]
+    fn open_add_frame_seeds_the_dialog_defaults() {
+        let mut state = ObjectsPanelState::default();
+        state.open_add_frame(Vec3::new(1.0, 2.0, 3.0), 4.0);
+        match &state.add_draft {
+            Some(AddDraft::Frame(frame)) => {
+                assert_eq!(frame.origin, Vec3::new(1.0, 2.0, 3.0));
+                assert_eq!(frame.length, 1.0, "a quarter of the scene scale");
+                assert_eq!(frame.speed, drag_speed(4.0));
+            }
+            _ => panic!("expected an open frame form"),
+        }
+        assert!(
+            !state.add_focus_pending,
+            "the frame form never requests text focus"
+        );
+    }
+
+    #[test]
+    fn open_add_marker_seeds_the_dialog_defaults() {
+        let mut state = ObjectsPanelState::default();
+        state.open_add_marker(Vec3::new(1.0, -1.0, 2.0), 5.0);
+        match &state.add_draft {
+            Some(AddDraft::Marker(marker)) => {
+                assert_eq!(marker.shape, MarkerShape::Text);
+                assert_eq!(marker.anchor, Vec3::new(1.0, -1.0, 2.0));
+                assert!(marker.text.is_empty(), "the label starts empty");
+                assert_eq!(marker.start, Vec3::new(1.0, -1.0, 2.0));
+                assert_eq!(
+                    marker.end,
+                    Vec3::new(2.0, -1.0, 2.0),
+                    "the arrow tip waits a fifth of the scale along +X"
+                );
+                assert_eq!(marker.speed, drag_speed(5.0));
+            }
+            _ => panic!("expected an open marker form"),
+        }
+        assert!(
+            state.add_focus_pending,
+            "the text shape requests the label field's focus"
+        );
+    }
+
+    #[test]
+    fn toggle_and_switch_of_the_inline_forms() {
+        let mut state = ObjectsPanelState::default();
+        assert!(state.add_draft.is_none(), "no form open by default");
+
+        // Opening a kind and closing it again (the re-click toggle).
+        state.open_add_frame(Vec3::ZERO, 1.0);
+        assert!(matches!(state.add_draft, Some(AddDraft::Frame(_))));
+        state.close_add();
+        assert!(state.add_draft.is_none());
+
+        // Opening one kind replaces the other (one form at a time).
+        state.open_add_marker(Vec3::ZERO, 1.0);
+        assert!(matches!(state.add_draft, Some(AddDraft::Marker(_))));
+        state.open_add_frame(Vec3::ZERO, 1.0);
+        assert!(matches!(state.add_draft, Some(AddDraft::Frame(_))));
+        assert!(
+            !state.add_focus_pending,
+            "the frame open clears the request"
+        );
+
+        state.close_add();
+        assert!(state.add_draft.is_none());
+        assert!(
+            !state.add_focus_pending,
+            "closing drops any pending focus request"
+        );
+    }
+
+    #[test]
+    fn commit_add_frame_returns_defaults_and_closes() {
+        let mut state = ObjectsPanelState::default();
+        assert_eq!(state.commit_add_frame(), None, "no frame form open");
+
+        state.open_add_frame(Vec3::new(2.0, 0.0, -1.0), 8.0);
+        let add = state
+            .commit_add_frame()
+            .expect("the open frame form commits");
+        assert_eq!(add.0, Vec3::new(2.0, 0.0, -1.0));
+        assert_eq!(add.1, 2.0, "a quarter of the scale, the dialog-era seed");
+        assert!(
+            state.add_draft.is_none(),
+            "a frame add is one-shot: the form closes"
+        );
+    }
+
+    #[test]
+    fn commit_add_marker_requires_text_and_keeps_the_form_open() {
+        let mut state = ObjectsPanelState::default();
+        assert!(
+            state.commit_add_marker().is_none(),
+            "no marker form open"
+        );
+
+        state.open_add_marker(Vec3::new(0.0, 1.0, 0.0), 2.0);
+        assert!(
+            state.commit_add_marker().is_none(),
+            "an empty label would be invisible: refused"
+        );
+        assert!(
+            matches!(state.add_draft, Some(AddDraft::Marker(_))),
+            "the refused commit keeps the form open for typing"
+        );
+
+        let text = match &mut state.add_draft {
+            Some(AddDraft::Marker(marker)) => &mut marker.text,
+            _ => unreachable!(),
+        };
+        text.push_str("  note  ");
+        let marker = state.commit_add_marker().expect("a label commit");
+        let Marker::Text(label) = &marker else {
+            panic!("a label commit must produce a text marker");
+        };
+        assert_eq!(label.anchor, Vec3::new(0.0, 1.0, 0.0));
+        assert_eq!(label.text, "note", "the committed text is trimmed");
+        assert!(
+            matches!(state.add_draft, Some(AddDraft::Marker(_))),
+            "the marker form stays open for repeat adds"
+        );
+        let cleared = match &state.add_draft {
+            Some(AddDraft::Marker(marker)) => &marker.text,
+            _ => unreachable!(),
+        };
+        assert!(cleared.is_empty(), "a committed label clears its field");
+    }
+
+    #[test]
+    fn commit_add_marker_arrow_keeps_its_default_endpoints() {
+        let mut state = ObjectsPanelState::default();
+        state.open_add_marker(Vec3::new(1.0, 2.0, 3.0), 10.0);
+        match &mut state.add_draft {
+            Some(AddDraft::Marker(marker)) => marker.shape = MarkerShape::Arrow,
+            _ => unreachable!(),
+        };
+        let marker = state.commit_add_marker().expect("an arrow commit");
+        let Marker::Arrow(arrow) = &marker else {
+            panic!("an arrow commit must produce an arrow marker");
+        };
+        assert_eq!(arrow.start, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(
+            arrow.end,
+            Vec3::new(3.0, 2.0, 3.0),
+            "the tip keeps its seed a fifth of the scale along +X"
+        );
+        assert!(
+            matches!(state.add_draft, Some(AddDraft::Marker(_))),
+            "the marker form stays open for repeat adds"
+        );
+    }
+
+    #[test]
+    fn committing_one_kind_never_touches_the_other() {
+        let mut state = ObjectsPanelState::default();
+        state.open_add_marker(Vec3::ZERO, 1.0);
+        assert_eq!(
+            state.commit_add_frame(),
+            None,
+            "a marker form cannot commit a frame"
+        );
+        assert!(
+            matches!(state.add_draft, Some(AddDraft::Marker(_))),
+            "the refused commit leaves the marker form open"
+        );
+
+        state.open_add_frame(Vec3::ZERO, 1.0);
+        assert!(
+            state.commit_add_marker().is_none(),
+            "a frame form cannot commit a marker"
+        );
+        assert!(matches!(state.add_draft, Some(AddDraft::Frame(_))));
     }
 }
