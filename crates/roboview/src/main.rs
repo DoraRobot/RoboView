@@ -9,7 +9,8 @@
 //! a readable error (spec A10). Frames and markers are added through the
 //! objects panel dialogs instead (spec §7 F3/F4).
 //!
-//! Layout of the frame (`App::update`, display-types plan §3.4):
+//! Layout of the frame (`App::update`, ui-blueprint plan A5 — the fixed
+//! layout period of 004 spec §6, before the 006 dock):
 //!
 //! 1. Align the renderer and the scene pipeline family with eframe's wgpu
 //!    render state (created once it exists, rebuilt when the target format
@@ -18,9 +19,17 @@
 //!    data, a failure keeps the current objects and shows an error window.
 //! 3. Install pending data once a renderer exists (single-flight; upload
 //!    and scene add happen here, on the UI thread).
-//! 4. Draw the menu bar (File → Open point cloud / mesh / path), the left
-//!    objects panel (Fit, Add frame / marker, the object list), and the
-//!    central viewport panel filling the rest.
+//! 4. Draw the four-region fixed skeleton (spec §6): the top menu bar
+//!    (File → Open point cloud / mesh / path + Language), the bottom
+//!    status-band placeholder (task T15 owns the real status bar), the
+//!    left objects panel (Fit, Add frame / marker, the object list), the
+//!    right properties placeholder (task T14 owns the real panel), and the
+//!    central viewport filling the rest — the central panel always comes
+//!    last. The side regions are width-constrained (left 180–360, right
+//!    200–360) so the 480×360 minimum window keeps a viewport sliver (spec
+//!    A13): egui clamps every panel to the space that remains, and the
+//!    viewport guards degenerate rects (ui/viewport.rs), so squeezing the
+//!    window never panics.
 //! 5. Draw the non-modal error window and the two add dialogs on top.
 //!
 //! Loading never blocks the UI thread: the dialog choice spawns a worker
@@ -44,6 +53,7 @@ use roboview_core::io::{self, LoadError, LoadedObject};
 
 use ui::objects_panel::{self, AddFrameDialog, AddMarkerDialog};
 use ui::texts;
+use ui::theme;
 use ui::viewport::{self, ViewportState};
 
 /// The three file families the File menu opens. Each maps to the dialog
@@ -345,9 +355,20 @@ impl RoboViewApp {
     /// derived from the visible scene.
     fn objects_panel(&mut self, ctx: &egui::Context) {
         let state = Arc::clone(&self.viewport);
+        // Width constraint of the four-region skeleton (004 spec §6, A13):
+        // at the 480×360 minimum window the panel stays ≥ 180 px wide while
+        // the viewport keeps a sliver; egui clamps the panel to the space
+        // that remains when the window is tighter.
+        // Task T12 (A6, objects_panel.rs) upgrades this panel's internals
+        // and extends this entry point with an app-owned ObjectsPanelState;
+        // main.rs wires the field into the call once the type lands there
+        // (exact signature per T12's report).
+        let frame = region_frame(&ctx.style());
         let requests = egui::SidePanel::left(egui::Id::new("objects_panel"))
             .resizable(true)
             .default_width(230.0)
+            .width_range(180.0..=360.0)
+            .frame(frame)
             .show(ctx, |ui| {
                 objects_panel::show_objects_panel(ui, &state, self.locale)
             })
@@ -360,6 +381,47 @@ impl RoboViewApp {
             let (center, scale) = viewport::lock_state(&self.viewport).ui_defaults();
             self.add_marker_dialog.open(center, scale);
         }
+    }
+
+    /// The right properties region — a shell of the four-region skeleton
+    /// (004 spec §6). Task T14 (A8, `properties_panel.rs`) replaces this
+    /// placeholder with the grouped property cards; this round only
+    /// reserves the region and its width constraint so the 480×360 minimum
+    /// window composition (A13) already matches the final layout.
+    ///
+    /// Deliberately empty: no copy is shown until the real panel lands
+    /// (all user-facing copy lives in `texts.rs`, which has no properties
+    /// keys yet — T14 adds the ones it needs).
+    fn properties_placeholder(&mut self, ctx: &egui::Context) {
+        let frame = region_frame(&ctx.style());
+        egui::SidePanel::right(egui::Id::new("properties_panel"))
+            .resizable(true)
+            .default_width(220.0)
+            .width_range(200.0..=360.0)
+            .frame(frame)
+            .show(ctx, |_ui| {
+                // T14 draws the property cards here. The id above is the
+                // panel's final identity, so the width a user chose
+                // survives the placeholder → properties_panel swap.
+            });
+    }
+
+    /// The bottom status region — a shell of the four-region skeleton (004
+    /// spec §6). Task T15 (A9, `status_bar.rs`) replaces this strip with
+    /// the status bar + lightweight message area; this round only reserves
+    /// a fixed-height band (drawn before the side panels, so it spans the
+    /// full window width) for the final composition. Deliberately empty:
+    /// no copy until the real bar lands (all copy lives in `texts.rs`).
+    fn status_bar_placeholder(&mut self, ctx: &egui::Context) {
+        let frame = region_frame(&ctx.style());
+        egui::TopBottomPanel::bottom(egui::Id::new("status_bar"))
+            .resizable(false)
+            .exact_height(26.0)
+            .frame(frame)
+            .show(ctx, |_ui| {
+                // T15 draws loading / FPS / pointer-world-coordinate /
+                // tool-hint readouts here, below the side panels.
+            });
     }
 
     /// Non-modal error notification: a closable window anchored top-right.
@@ -420,21 +482,27 @@ impl eframe::App for RoboViewApp {
         self.poll_background_load();
         self.install_pending_object();
 
-        // 4. Panels: menu bar on top, then the objects panel on the left
-        // and the viewport filling the rest (plan §3.4).
+        // 4. Four-region fixed skeleton (004 spec §6): the top menu bar,
+        // the full-width bottom status-band placeholder (T15), the left
+        // objects panel, the right properties placeholder (T14), and the
+        // central viewport last — it fills whatever the regions leave.
         egui::TopBottomPanel::top(egui::Id::new("menu_bar")).show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 self.menu_bar(ui);
             });
         });
 
+        self.status_bar_placeholder(ctx);
         self.objects_panel(ctx);
+        self.properties_placeholder(ctx);
 
-        let panel_fill = ctx.style().visuals.panel_fill;
         let viewport_state = Arc::clone(&self.viewport);
         let loading = self.load.is_some();
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(panel_fill))
+            // The viewport floor token (004 spec §6, ui/theme.rs): the
+            // neutral backdrop behind the 3D content, pinned to the palette
+            // instead of a per-frame derivation from the theme's panel fill.
+            .frame(egui::Frame::NONE.fill(theme::VIEWPORT_FLOOR))
             .show(ctx, |ui| {
                 viewport::show_viewport(ui, &viewport_state, loading, self.locale);
             });
@@ -445,6 +513,16 @@ impl eframe::App for RoboViewApp {
         self.add_marker_dialog
             .show(ctx, &self.viewport, self.locale);
     }
+}
+
+/// Panel chrome of the four-region skeleton (004 spec §6): egui's standard
+/// side/top-bottom panel frame filled with the semantic palette token
+/// `theme::PANEL_BACKGROUND` instead of a per-frame derivation from the
+/// theme's `panel_fill`. The token is the same dark gray today
+/// (ui/theme.rs), so the swap is visually a no-op that pins the fill to
+/// one source.
+fn region_frame(style: &egui::Style) -> egui::Frame {
+    egui::Frame::side_top_panel(style).fill(theme::PANEL_BACKGROUND)
 }
 
 /// Load-succeeded log line, one per file family (the worker thread).
