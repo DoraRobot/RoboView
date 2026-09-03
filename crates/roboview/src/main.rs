@@ -209,6 +209,9 @@ struct RoboViewApp {
     /// the non-modal error window keeps showing the event until dismissed
     /// — the two coexist until the 007 message center replaces the window.
     messages: Vec<MessageItem>,
+    /// Debug repro hook (ROBOVIEW_AUTOLOAD=<path>): open a file right
+    /// after startup, no dialogs. Removed once the load-path bug is fixed.
+    auto_load: Option<std::path::PathBuf>,
     /// A12/M9 perf-protocol hooks (004 T18, env-gated debug affordances):
     /// the procedurally generated demo scene (ROBOVIEW_DEMO_SCENE=1), the
     /// ids it produced (selection sweep), and the last-second sampling
@@ -256,6 +259,7 @@ impl RoboViewApp {
             objects_state: ObjectsPanelState::default(),
             status_bar: StatusBar::new(),
             messages: Vec::new(),
+            auto_load: std::env::var("ROBOVIEW_AUTOLOAD").ok().map(Into::into),
             demo_install: if std::env::var("ROBOVIEW_DEMO_SCENE").is_ok() {
                 Some(demo_pending_objects())
             } else {
@@ -518,12 +522,12 @@ impl RoboViewApp {
                 let next = queue.remove(0);
                 if viewport::lock_state(&self.viewport).install_object(next.object, &next.name) {
                     tracing::info!(name = %next.name, "demo scene object added");
-                    if let Some(id) = viewport::lock_state(&self.viewport)
+                    let new_id = viewport::lock_state(&self.viewport)
                         .scene
                         .iter()
                         .last()
-                        .map(|o| o.id)
-                    {
+                        .map(|o| o.id);
+                    if let Some(id) = new_id {
                         self.demo_ids.push(id);
                     }
                 }
@@ -561,12 +565,16 @@ impl RoboViewApp {
             // color (T16-2 note). The viewport registry already synced the
             // tree's per-kind defaults and reports the unset sentinel when
             // none is configured.
-            if let Some(id) = viewport::lock_state(&self.viewport)
+            // NOTE: the id is read into a plain variable first — an
+            // `if let` scrutinee temporary (the MutexGuard) would stay
+            // alive through the whole branch, and the re-lock below would
+            // self-deadlock on the non-reentrant std Mutex.
+            let new_id = viewport::lock_state(&self.viewport)
                 .scene
                 .iter()
                 .last()
-                .map(|o| o.id)
-            {
+                .map(|o| o.id);
+            if let Some(id) = new_id {
                 let mut lock = viewport::lock_state(&self.viewport);
                 lock.apply_new_member_default_color(id, kind);
             }
@@ -894,6 +902,13 @@ impl eframe::App for RoboViewApp {
         }
 
         // 2. + 3. Load outcomes → pending data → install (see struct docs).
+        if let Some(path) = self.auto_load.take() {
+            if self.load.is_none() {
+                let kind = OpenKind::PointCloud;
+                let path: PathBuf = path;
+                self.start_background_load(ctx, path, kind);
+            }
+        }
         self.poll_background_load();
         self.install_pending_object();
 
