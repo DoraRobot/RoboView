@@ -47,3 +47,4 @@
 - T1 `9a94e7a`（muda 依赖：macOS 目标门控 + default-features=false；传递 crossbeam-channel/keyboard-types 进 lock，deny 零改动）。
 - T2 `3dca778`（spike 端到端实测：注入时序/空闲唤醒/locale 重建/Quit 均成立——详见 plan §5 回填；手动项：无闪烁目视、Cmd+Q 键等效、bundle 名）。
 - T4 `82d688e`（轴色常量 pub + 002 A4 语义锁测试：28 passed；pub 链路全可达，无需导出改动）。
+- T5 `2f6bb9b`（grid.rs 网格生成纯函数：LOD 分级/生成端裁剪/snap 对齐——A11 no-crawl 位级测试钉死；16 UT；`render/mod.rs` 注册随 `3dca778` 后协调提交，workspace 测试通过；`segment_capacity_bound` 供 T6 容量预建）。
