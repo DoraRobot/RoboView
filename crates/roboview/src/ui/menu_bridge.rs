@@ -1,30 +1,43 @@
-//! Native macOS menu bridge — 004 wiring spike (004 plan A3 / task T2).
+//! Native macOS menu bridge — the transport half of the 004 main-menu dual
+//! path (004 spec §6 "主菜单栏策略" D5, plan §3.4; T2 spike → T10).
 //!
-//! The spike validates the three claims of the 004 main-menu-bar strategy
-//! (004 spec §6) that the full menu tree (T10, `ui/menu.rs`) will build on:
+//! The bridge owns the *transport and the tree's lifetime*, nothing else:
 //!
-//! * **injection timing**: `muda::Menu::init_for_nsapp()` runs inside
-//!   `RoboViewApp::new` — i.e. after winit's `applicationDidFinishLaunching`
-//!   installs the default menu (`menu::initialize` precedes
-//!   `dispatch_init_events`, which drives the eframe creation callback) and
-//!   before the first frame paints;
+//! * **injection timing**: the real tree (built by `ui::menu::build_native`,
+//!   task T10) is handed to [`init_bridge_with_menu`] and installed with
+//!   `muda::Menu::init_for_nsapp()` inside `RoboViewApp::new` — after
+//!   winit's `applicationDidFinishLaunching` installs the default menu
+//!   (`menu::initialize` precedes `dispatch_init_events`, which drives the
+//!   eframe creation callback) and before the first frame paints. Until the
+//!   main.rs wiring lands, the spike-era call site keeps compiling through
+//!   the transitional [`init_bridge`] (single-argument; forwards a
+//!   default-English tree — delete it with the wiring, T10 recipe);
 //! * **idle wake-up**: `MenuEvent::set_event_handler` (a process-wide
 //!   `OnceCell`, exactly one `Some` registration) captures the `egui`
 //!   context and calls `request_repaint()`, so a click on an idle app wakes
 //!   the eframe loop; events queue internally and [`BridgeCtx::drain`]
-//!   collects them once per `App::update`;
-//! * **locale relabel**: rebuilding labels walks the *items* layer only (a
-//!   top-level `Menu` has no `set_text`) and exercises `Submenu::set_text`
-//!   / `MenuItem::set_text` on every reachable node.
+//!   collects them once per `App::update`. `request_repaint()` is reliable
+//!   end-to-end; pre-scheduled `request_repaint_after` wake-ups are not
+//!   (T2 spike measurements, plan §5) — hence the probe's re-arm loop below;
+//! * **locale relabel**: [`BridgeCtx::relabel`] delegates to
+//!   `ui::menu::relabel`, which walks the *items* layer only (a top-level
+//!   `Menu` has no `set_text`) — the verified T2 mechanism, now over the
+//!   real tree;
+//! * **single-flight guard**: [`BridgeCtx::set_open_enabled`] mirrors the
+//!   app's loading state onto the File → Open… item;
+//! * **check reconciliation**: [`BridgeCtx::set_grid_checked`] /
+//!   [`BridgeCtx::set_axes_checked`] sync the native check marks when the
+//!   authoritative toggle state changes through a non-menu door (T13
+//!   wiring; muda auto-toggles the mark on a menu click itself, so the menu
+//!   door needs no reconcile — see `ui/menu.rs` module docs).
 //!
 //! Ownership: muda menu objects are `Rc`-based (macOS-implementation
 //! handles) and therefore not `Send`/`Sync` — the bridge is a main-thread
-//! object owned by the app struct, never a `static`. The event queue it
-//! drains is the one `Send`-safe piece and lives in a static.
+//! object owned by the app struct, never a `static`, and the app keeps it
+//! alive for the whole process lifetime (muda's native items dereference
+//! their Rust-side child storage on click). The event queue it drains is
+//! the one `Send`-safe piece and lives in a static.
 //!
-//! The spike tree is a placeholder (application-menu Quit plus
-//! File → Language with English / 中文（简体） entries); its labels are spike
-//! copy, deliberately not `ui::texts` keys — T10 sources the real copy.
 //! Non-macOS targets compile a no-op module (muda is a macOS-only
 //! dependency, 004 spec §6: the gate is a compile requirement).
 
@@ -35,14 +48,22 @@ mod platform {
     use std::time::{Duration, Instant};
 
     use eframe::egui;
-    use muda::{Menu, MenuEvent, MenuId, MenuItemKind};
+    use muda::{Menu, MenuEvent};
+
+    // The tree builder/relabeler (`ui::menu`): the bridge never shapes the
+    // tree itself — T10 moved the spike's placeholder build there, so the
+    // placeholder and the real tree cannot coexist.
+    use super::super::menu;
+    use super::super::texts::Locale;
 
     /// Environment variable that arms the relabel probe: ~3 s after
-    /// startup the bridge relabels the spike tree to Chinese and back to
-    /// English in the same frame. The automated smoke run cannot click a
-    /// menu, so this drives the same items-layer `set_text` path that the
-    /// spec's locale switch prescribes (004 spec §6: label rebuild walks
-    /// the items layer).
+    /// startup the bridge rebuilds the real tree's labels to Chinese and
+    /// back to English in the same frame. The automated smoke run cannot
+    /// click a menu, so this drives the same items-layer `set_text` path
+    /// that the spec's locale switch prescribes (004 spec §6: label
+    /// rebuild walks the items layer) over the *production* relabel
+    /// function. The env name is kept from the T2 spike so existing smoke
+    /// scripts keep working.
     const PROBE_ENV: &str = "ROBOVIEW_SPIKE_REBUILD";
 
     /// Delay after which the relabel probe fires.
@@ -54,35 +75,14 @@ mod platform {
     /// deadline check is made forgiving instead.
     const PROBE_SLACK: Duration = Duration::from_millis(20);
 
-    /// Stable ids of the spike items: the drain log reports them verbatim,
-    /// so a manual click test is identifiable per item. T10 maps ids to the
-    /// `AppAction` enum instead.
-    const ID_APP: &str = "menu_spike_app";
-    const ID_FILE: &str = "menu_spike_file";
-    const ID_OPEN: &str = "menu_spike_open";
-    const ID_LANGUAGE: &str = "menu_spike_language";
-    const ID_LANG_EN: &str = "menu_spike_lang_en";
-    const ID_LANG_ZH: &str = "menu_spike_lang_zh";
-
-    /// Spike copy for the relabel probe: (menu id, English, Chinese). The
-    /// app-menu title, the quit item, and the self-named locale entries are
-    /// intentionally absent (macOS replaces the first submenu title with the
-    /// app name; quit and the locale entries keep their labels under both
-    /// locales, mirroring the in-window menu).
-    const SPIKE_LABELS: &[(&str, &str, &str)] = &[
-        (ID_FILE, "File", "文件"),
-        (ID_OPEN, "Open…", "打开…"),
-        (ID_LANGUAGE, "Language", "语言"),
-    ];
-
     /// The registered bridge: the muda tree plus the state the per-frame
     /// drain needs. Owned by the app (see the module docs for why it cannot
-    /// be a static); muda's native items dereference their Rust-side child
-    /// storage on click (muda 0.19.3 `platform_impl/macos`,
-    /// `MenuItem::fire_menu_item_click`), so the app must keep it alive for
-    /// the whole process lifetime.
+    /// be a static).
     pub(crate) struct BridgeCtx {
-        /// Root menu installed as the `NSApplication` main menu.
+        /// Root menu installed as the `NSApplication` main menu. Built by
+        /// `ui::menu::build_native` and kept alive here — muda's native
+        /// items dereference their Rust-side child storage on click, so the
+        /// app must keep the bridge alive for the whole process lifetime.
         menu: Menu,
         /// `egui` context of the hosting app: wake-up requests for the
         /// idle loop and for the relabel probe's future frames.
@@ -94,12 +94,44 @@ mod platform {
     impl BridgeCtx {
         /// Take the queued native menu events since the last frame and run
         /// the relabel probe stages that are due. Called from the head of
-        /// `App::update`; the spike logs each event, T10 dispatches them to
-        /// `AppAction`.
+        /// `App::update`; the app maps each event through
+        /// `ui::menu::action_from_id` and dispatches the `AppAction` (the
+        /// single dispatch point of the dual path).
         pub(crate) fn drain(&mut self) -> Vec<MenuEvent> {
             let events: Vec<MenuEvent> = EVENT_QUEUE.lock().unwrap().drain(..).collect();
             self.poll_relabel_probe();
             events
+        }
+
+        /// Rebuild every translatable label of the native tree for
+        /// `locale` (items-layer walk, `ui::menu::relabel`). Called by the
+        /// locale-switch dispatch right before the app-wide `Locale` change
+        /// takes effect. Returns the number of labels set.
+        pub(crate) fn relabel(&self, locale: Locale) -> usize {
+            menu::relabel(&self.menu, locale)
+        }
+
+        /// Mirror the app's loading state onto the File → Open… item
+        /// (single-flight loading, 004 spec §6): `false` while a background
+        /// load runs, `true` again once it settles. Call sites: the
+        /// `start_background_load` / `poll_background_load` pair in main.rs
+        /// (T10 wiring recipe).
+        #[allow(dead_code)] // wired with the main.rs single-flight dispatch
+        pub(crate) fn set_open_enabled(&self, enabled: bool) {
+            menu::set_open_enabled(&self.menu, enabled);
+        }
+
+        /// Sync the native Grid check mark to the authoritative toggle
+        /// state (T13 wiring: the toolbar/HUD doors of the same toggle).
+        #[allow(dead_code)] // wired with the T13 toggle doors
+        pub(crate) fn set_grid_checked(&self, checked: bool) {
+            menu::set_grid_checked(&self.menu, checked);
+        }
+
+        /// Sync the native Axes check mark; see [`Self::set_grid_checked`].
+        #[allow(dead_code)] // wired with the T13 toggle doors
+        pub(crate) fn set_axes_checked(&self, checked: bool) {
+            menu::set_axes_checked(&self.menu, checked);
         }
 
         /// Schedule the relabel probe when [`PROBE_ENV`] is set.
@@ -115,11 +147,11 @@ mod platform {
         }
 
         /// Fire the relabel probe once its deadline is reached: two full
-        /// items-layer rebuilds (en → zh → en) in the same frame. Until
-        /// then, re-arm the eframe wake-up on every frame — an idle app
-        /// otherwise never polls this again (a one-shot request made before
-        /// the event loop starts is not reliably honored, observed in the
-        /// spike runs).
+        /// items-layer rebuilds of the *real* tree (zh → en) in the same
+        /// frame. Until then, re-arm the eframe wake-up on every frame — an
+        /// idle app otherwise never polls this again (a one-shot request
+        /// made before the event loop starts is not reliably honored,
+        /// observed in the spike runs).
         fn poll_relabel_probe(&mut self) {
             let Some(probe) = self.probe.take() else {
                 return;
@@ -132,32 +164,16 @@ mod platform {
                 self.probe = Some(probe);
                 return;
             }
-            let set_zh = self.rebuild_labels(true);
-            tracing::info!(
-                labels = set_zh,
-                "menu relabel probe: spike labels now Chinese"
-            );
-            let set_en = self.rebuild_labels(false);
-            tracing::info!(
-                labels = set_en,
-                "menu relabel probe: spike labels now English"
-            );
-        }
-
-        /// Rebuild every translatable label of this bridge's tree. Returns
-        /// the number of labels set; used by the relabel probe.
-        fn rebuild_labels(&self, chinese: bool) -> usize {
-            let mut count = 0;
-            for kind in self.menu.items() {
-                count += relabel_kind(&kind, chinese);
-            }
-            count
+            let set_zh = self.relabel(Locale::ZhCn);
+            tracing::info!(labels = set_zh, "menu relabel probe: labels now Chinese");
+            let set_en = self.relabel(Locale::En);
+            tracing::info!(labels = set_en, "menu relabel probe: labels now English");
         }
     }
 
     /// Set on a successful bridge install; guards the init so the
     /// `MenuEvent` handler is registered exactly once (muda's own OnceCell
-    /// would silently ignore a second registration, but the menu build
+    /// would silently ignore a second registration, but the menu install
     /// below must not run twice either).
     static REGISTERED: OnceLock<()> = OnceLock::new();
 
@@ -175,17 +191,32 @@ mod platform {
         at: Instant,
     }
 
-    /// Register the bridge: build and install the spike menu and register
-    /// the process-wide event handler. Must run early in `App::new` (main
-    /// thread, after winit created `NSApplication`). Returns `None` when a
-    /// bridge is already registered.
+    /// Transitional entry serving the spike-era `main.rs` call site
+    /// (`RoboViewApp::new` — `ui::menu_bridge::init_bridge(&cc.egui_ctx)`,
+    /// a main.rs text this module cannot change until the T10 wiring
+    /// pass): forwards the real tree built at the default English locale to
+    /// [`init_bridge_with_menu`], so the app keeps compiling and running in
+    /// the interim. The wiring replaces this call site with
+    /// `init_bridge_with_menu(&ctx, ui::menu::build_native(locale))` using
+    /// the sys-locale value, then deletes this shim (T10 integration
+    /// recipe).
+    #[allow(dead_code)] // remove together with the main.rs call site it serves
     pub(crate) fn init_bridge(ctx: &egui::Context) -> Option<BridgeCtx> {
+        init_bridge_with_menu(ctx, menu::build_native(Locale::En))
+    }
+
+    /// Register the bridge: install the real menu tree built by
+    /// `ui::menu::build_native(locale)` and register the process-wide event
+    /// handler. Must run early in `App::new` (main thread, after winit
+    /// created `NSApplication`). Returns `None` when a bridge is already
+    /// registered (the tree argument is then dropped uninstalled — the
+    /// caller should not have built one in that case).
+    #[allow(dead_code)] // awaited by the main.rs wiring call (T10 recipe)
+    pub(crate) fn init_bridge_with_menu(ctx: &egui::Context, menu: Menu) -> Option<BridgeCtx> {
         if REGISTERED.get().is_some() {
             tracing::warn!("native menu bridge already registered; skipping duplicate init");
             return None;
         }
-        // The menu tree must be built on the main thread; `App::new` is.
-        let menu = build_spike_menu();
         let ctx = ctx.clone();
         let handler_ctx = ctx.clone();
         // Register the handler before installing the menu so no click can
@@ -207,95 +238,15 @@ mod platform {
             probe: None,
         };
         bridge.arm_relabel_probe();
-        tracing::info!("native menu bridge registered (004 spike: main menu installed)");
+        tracing::info!("native menu bridge registered (004 T10: real menu tree installed)");
         Some(bridge)
-    }
-
-    /// The placeholder spike tree: application menu (Quit) first — the
-    /// first top-level submenu is the application menu on macOS — then
-    /// File with a placeholder Open entry and the Language submenu, the
-    /// same shape as the in-window menu (main.rs `menu_bar`).
-    fn build_spike_menu() -> Menu {
-        let menu = Menu::new();
-
-        let app_menu = muda::Submenu::with_id(ID_APP, "RoboView", true);
-        let quit = muda::PredefinedMenuItem::quit(Some("Quit RoboView"));
-        app_menu.append(&quit).expect("append Quit to the app menu");
-        menu.append(&app_menu).expect("append the app submenu");
-
-        let file_menu = muda::Submenu::with_id(ID_FILE, "File", true);
-        let open = muda::MenuItem::with_id(ID_OPEN, "Open…", true, None);
-        file_menu
-            .append(&open)
-            .expect("append the Open placeholder");
-        file_menu
-            .append(&muda::PredefinedMenuItem::separator())
-            .expect("append the separator");
-        let language_menu = muda::Submenu::with_id(ID_LANGUAGE, "Language", true);
-        // Self-named entries, like the in-window language menu: stable
-        // identifiers under both locales (003 spec §6.2).
-        let english = muda::MenuItem::with_id(ID_LANG_EN, "English", true, None);
-        let chinese = muda::MenuItem::with_id(ID_LANG_ZH, "中文（简体）", true, None);
-        language_menu
-            .append(&english)
-            .expect("append the English entry");
-        language_menu
-            .append(&chinese)
-            .expect("append the Chinese entry");
-        file_menu
-            .append(&language_menu)
-            .expect("append the Language submenu");
-
-        menu.append(&file_menu).expect("append the File submenu");
-        menu
-    }
-
-    /// Relabel one menu tree rooted at `kind`; returns the number of labels
-    /// set. Recurses into submenus so every items layer of the tree is
-    /// exercised (top-level `Menu` items are submenus here; a `Menu` itself
-    /// has no `set_text` — spec §6).
-    fn relabel_kind(kind: &MenuItemKind, chinese: bool) -> usize {
-        match kind {
-            MenuItemKind::Submenu(submenu) => {
-                let mut count = 0;
-                if let Some(text) = spike_label(submenu.id(), chinese) {
-                    submenu.set_text(text);
-                    count += 1;
-                }
-                for nested in submenu.items() {
-                    count += relabel_kind(&nested, chinese);
-                }
-                count
-            }
-            MenuItemKind::MenuItem(item) => {
-                if let Some(text) = spike_label(item.id(), chinese) {
-                    item.set_text(text);
-                    1
-                } else {
-                    0
-                }
-            }
-            // Predefined (Quit, separator), check, and icon items keep
-            // their labels under both locales.
-            MenuItemKind::Predefined(_) | MenuItemKind::Check(_) | MenuItemKind::Icon(_) => 0,
-        }
-    }
-
-    /// The spike label for `id` in the requested language, if the node
-    /// carries a translatable label.
-    fn spike_label(id: &MenuId, chinese: bool) -> Option<&'static str> {
-        SPIKE_LABELS
-            .iter()
-            .copied()
-            .find(|(key, _, _)| *key == id.0)
-            .map(|(_, en, zh)| if chinese { zh } else { en })
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod platform {
-    //! No-op: the native menu bar of this spike exists on macOS only; the
-    //! cross-platform tree lands in T10 (`ui/menu.rs`).
+    //! No-op: the native menu bar exists on macOS only; the Win/Linux
+    //! in-window path lives in `ui/menu.rs` (`egui_menu_bar`).
 }
 
 pub(crate) use platform::*;
