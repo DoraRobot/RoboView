@@ -33,6 +33,7 @@
 | T17 | W6 | 添加▾内联 | `objects_panel.rs`+`main.rs`：浮动 Add 窗口移除；工具栏"添加▾"内联表单（默认值+回车即加）；对话框生命周期清理；002 A6 回归（浮动窗口相关判据按 spec 取代声明语义等价执行） | A11/A5、M3 | T12、T11 | ☐ |
 | T18 | W7 | 性能协议执行 | A12：场景 C + 网格开/关 × 选中通道轮询，A11 固定协议（release/参考机/采样），p95≤33ms 且网格开 ≤ 关 +1ms；记录入 `.leon` | A12/M9 | T7、T13、T16 | ☐ |
 | T19 | W7 | 回归 | M6/A10：001–003 全量（En 语义等价；002 被取代子句="入口/展示形态、属性编辑面板非目标"除外；A6 台账判据保留）；A13：zh 480×360 最小窗口复验（003 A4 判据）；路径守卫；五门禁/三平台/msrv | A10、A13/M6 | 全部 | ☐ |
+| T20 | W4（补） | 工具条 | `main.rs`：顶部菜单栏下方工具条（打开▾（Open 族分派+单飞禁用）/Fit/添加▾/轴/网格——D3 裁定按钮集；Grid/Axes 与 HUD 角标双入口同状态（T13 状态源）；样式用 theme token；文案用 T9 键）——**拆分遗漏补登记**：spec 骨架图工具条在 T11 未覆盖 | A5/A1、M1 | T10、T12、T13（状态源接回） | ☐ |
 
 ## 备注
 
@@ -54,3 +55,4 @@
 - T8 `3d70210`（theme.rs 语义色板 token + A9 三断言：SELECT_HIGHLIGHT(255,128,0) 与轴色相差 ≥25°、GRID_LINE(70,70,70) 暗于全部语义色（Z 蓝为约束项）、ORIGIN_AXIS 引用 core 常量恒等锁——3 UT）。
 - T9 `9584454`（23 新键 EN/ZH 齐全、表对齐 UT 通过；显隐拆 Show/Hide 两键随状态切换；getter 暂挂 dead_code allow 待消费）。
 - T11 `d81df7c`（四区骨架：左 180–360/右 200–360/底 26px 全宽/Central 填充；占位面板 id=最终身份；480×360 构图余量验证；theme token 接入零视觉变化；menu_bridge/错误窗/Add 窗/空态门控全保留；T12 接线点+需求清单已备案）。
+- T10 `dfa36ae`（menu.rs 双路径：AppAction 全集（007 兼容预置）+ 稳定 id 字符串键空间 + `egui_menu_bar`/muda `build_native`（Grid/Axes=CheckMenuItem 自勾选同步）+ `relabel`（items 层 LABEL_KEYS 表）+ set_enabled/set_checked；bridge 重构为纯 transport（真树经 `init_bridge_with_menu`，过渡 `init_bridge` 保 main.rs 编译、接线后删）；5 新 UT+28/28 全绿；集成配方①–⑤交协调者）。
