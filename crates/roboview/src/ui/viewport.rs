@@ -28,7 +28,7 @@
 //! camera's visible ground patch and refreshed in place whenever the
 //! camera moves; lines always sit on world multiples, so the pattern never
 //! crawls (A11). Fading is generation-side — the window follows the zoom
-//! and the LOD ladder keeps a minimum spacing — so no alpha blending is
+//! and the uniform step keeps a minimum spacing — so no alpha blending is
 //! involved (the line pipeline draws blending-free). The grid and axes sit
 //! at the head of the line pass (plan §3.3, spec §6): they depth-test
 //! against the reference surface the point and mesh passes wrote but never
@@ -137,11 +137,11 @@ const AXIS_X_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 0, 0);
 const AXIS_Y_COLOR: egui::Color32 = egui::Color32::from_rgb(0, 255, 0);
 const AXIS_Z_COLOR: egui::Color32 = egui::Color32::from_rgb(0, 0, 255);
 
-/// Minor step (m) of the ground grid — the app's fixed pair, mirroring the
-/// grid module's defaults (render/grid.rs), whose LOD ladder is calibrated
-/// to exactly these values (spec §6: minor 0.2 m, major 1 m).
-const GRID_MINOR_STEP: f32 = 0.2;
-const GRID_MAJOR_STEP: f32 = 1.0;
+/// Step (m) of the ground grid — the app's fixed base, mirroring the grid
+/// module's default (render/grid.rs), which climbs the whole uniform grid
+/// through the 1-2-5 ladder as the camera pulls back (spec §6: one
+/// coherent grid, one step at a time — no concentric rings).
+const GRID_STEP: f32 = 1.0;
 /// Ceiling (m) of the ground-grid generation window radius. The persistent
 /// mesh is prebuilt to `segment_capacity_bound` of this radius and the
 /// per-frame window is clamped to it, so any reachable pose fits the
@@ -152,7 +152,7 @@ const GRID_RADIUS_CAP: f32 = 4.0e7;
 /// the float rounding of the frustum crossings.
 const GRID_RADIUS_MARGIN: f32 = 1.05;
 /// Fixed world length (m) of the world-origin axis trio (spec §6:
-/// "示意长度固定" — one major grid cell). World-fixed geometry never needs
+/// "示意长度固定" — one grid cell). World-fixed geometry never needs
 /// a camera-driven refresh, unlike the windowed grid.
 const ORIGIN_AXIS_LENGTH: f32 = 3.0;
 /// Radius (points) of the orientation indicator's backdrop disc.
@@ -952,8 +952,7 @@ impl ViewportState {
             // options radius fits `segment_capacity_bound(options)`, so
             // the window clamped to the cap below can never outgrow the
             // prebuilt buffers (render/grid.rs).
-            let options =
-                render::grid::GridOptions::new(GRID_MINOR_STEP, GRID_MAJOR_STEP, GRID_RADIUS_CAP);
+            let options = render::grid::GridOptions::new(GRID_STEP, GRID_RADIUS_CAP);
             let mesh = line_pipeline.with_capacity(render::grid::segment_capacity_bound(&options));
             self.grid_mesh = Some(mesh);
         }
@@ -962,7 +961,7 @@ impl ViewportState {
         };
         let view = render::grid::GridView::new(
             Vec3::new(window.center.x, window.center.y, 0.0),
-            render::grid::GridOptions::new(GRID_MINOR_STEP, GRID_MAJOR_STEP, window.radius),
+            render::grid::GridOptions::new(GRID_STEP, window.radius),
         );
         let strips = render::grid::grid_strips(&view);
         let mesh = self
@@ -1899,11 +1898,7 @@ mod tests {
             Vec2::new(800.0, 600.0),
             Vec2::new(480.0, 360.0),
         ];
-        let prebuild = segment_capacity_bound(&GridOptions::new(
-            GRID_MINOR_STEP,
-            GRID_MAJOR_STEP,
-            GRID_RADIUS_CAP,
-        ));
+        let prebuild = segment_capacity_bound(&GridOptions::new(GRID_STEP, GRID_RADIUS_CAP));
         let mut windows = 0usize;
         for &target in &targets {
             for &yaw in &yaws {
@@ -1941,7 +1936,7 @@ mod tests {
                             // window before the f32 cast).
                             let view = GridView::new(
                                 Vec3::new(window.center.x, window.center.y, 0.0),
-                                GridOptions::new(GRID_MINOR_STEP, GRID_MAJOR_STEP, window.radius),
+                                GridOptions::new(GRID_STEP, window.radius),
                             );
                             let strips = grid_strips(&view);
                             assert!(

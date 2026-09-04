@@ -1094,7 +1094,7 @@ mod tests {
             g: 210,
             b: 215,
         };
-        let bound = segment_capacity_bound(&GridOptions::new(0.2, 1.0, 1000.0));
+        let bound = segment_capacity_bound(&GridOptions::new(1.0, 1000.0));
         assert!(bound > 0);
 
         // Staging exactly as `with_capacity(bound)` provisions it: two
@@ -1109,8 +1109,7 @@ mod tests {
         let centers = [[0.0f32, 0.0], [0.33, 0.77], [12.3, -45.6], [-999.5, 777.7]];
         for [cx, cy] in centers {
             for radius in radii {
-                let view =
-                    GridView::new(Vec3::new(cx, cy, 0.0), GridOptions::new(0.2, 1.0, radius));
+                let view = GridView::new(Vec3::new(cx, cy, 0.0), GridOptions::new(1.0, radius));
                 let strips = grid_strips(&view);
                 assert!(!strips.is_empty());
 
