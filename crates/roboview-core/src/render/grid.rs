@@ -137,6 +137,18 @@ pub struct GridOptions {
 }
 
 impl GridOptions {
+    /// The half extent the grid actually generates for these options:
+    /// the visible-ground `radius` clamped to the 250·step fade bound —
+    /// the single source both [`grid_strips`] and the app's grid-bound
+    /// overlays (the origin axis-color rows, viewport.rs) clip against,
+    /// so no overlay can outlive the grid (005 revision 2026-09-05: the
+    /// axis lines had used the raw window radius and floated past the
+    /// grid while zoomed out).
+    pub fn half_extent(&self) -> f32 {
+        let step = uniform_step(self.step, self.px_per_m);
+        (self.radius).min(MAX_RADIUS_PER_STEP * step)
+    }
+
     /// Builds options from the raw values (no validation — invalid values
     /// are handled by [`grid_strips`], and a non-positive or non-finite
     /// `px_per_m` degrades to the base step).
@@ -269,7 +281,7 @@ pub fn grid_strips(view: &GridView) -> Vec<[Vec3; 2]> {
     let center = view.center.truncate();
     // Visible-ground window, clamped to the no-alpha fade cutoff (see
     // module docs): the farthest line is ≤ 250 steps away.
-    let half = (opts.radius as f64).min(MAX_RADIUS_PER_STEP as f64 * step as f64);
+    let half = opts.half_extent() as f64;
     let step = step as f64;
     // Lattice-index run over the window: every k·step with |k·step − c| ≤
     // half is a whole line (a f32-rounded lattice line can sit exactly on
@@ -473,6 +485,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn half_extent_is_the_grid_regenerated_extent() {
+        assert_eq!(GridOptions::new(1.0, 100.0, 2.0).half_extent(), 100.0);
+        // A horizon-grazing window is clamped to 250·step (the fade bound
+        // the strips and the app overlays share).
+        assert_eq!(GridOptions::new(1.0, 4.0e7, 2.0).half_extent(), 250.0);
+        assert_eq!(GridOptions::new(1.0, 4.0e7, 0.09).half_extent(), 12_500.0);
     }
 
     #[test]
