@@ -53,6 +53,7 @@
   路径守卫 A9 绿、release 冒烟（普通启动+两轮 demo 场景 C）0 panic。
 - T18 实测：网格开 p95=9.36ms / 关 9.25ms（样本 p95），开-关中位数 +0.10ms——均达判据（≤33ms / ≤+1ms）。
 - T19 判定：本地=全通过（语义等价 UT + 守卫）；CI 全矩阵与 MAN 目视清单归 .leon 遗留，待推送/负责人执行。
+- 运行修正（负责人目视反馈，2026-09-04）：`d2c3650` — 地面网格**均一化**（同心环 LOD 0.2/1/5m 分层 → 整窗均匀单步距，拉远时全窗 1→2→5…m 整步切换，与 Blender 等成熟工具一致；spec §6/A11 已修订，见第 9 行修订登记）。
 - T1 `9a94e7a`（muda 依赖：macOS 目标门控 + default-features=false；传递 crossbeam-channel/keyboard-types 进 lock，deny 零改动）。
 - T2 `3dca778`（spike 端到端实测：注入时序/空闲唤醒/locale 重建/Quit 均成立——详见 plan §5 回填；手动项：无闪烁目视、Cmd+Q 键等效、bundle 名）。
 - T4 `82d688e`（轴色常量 pub + 002 A4 语义锁测试：28 passed；pub 链路全可达，无需导出改动）。
