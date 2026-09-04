@@ -748,7 +748,14 @@ impl RoboViewApp {
             .frame(frame)
             .show(ctx, |ui| {
                 let lock = viewport::lock_state(&state);
-                objects_panel::ui(ui, &mut self.objects_state, &lock.scene, self.locale)
+                let selected_ids = viewport::lock_state(&state).selected_ids();
+                objects_panel::ui(
+                    ui,
+                    &mut self.objects_state,
+                    &lock.scene,
+                    self.locale,
+                    &selected_ids,
+                )
             })
             .inner;
         // Scene mutations the panel queued (rename/visibility/delete): the
@@ -795,7 +802,14 @@ impl RoboViewApp {
             .frame(frame)
             .show(ctx, |ui| {
                 let lock = viewport::lock_state(&self.viewport);
-                properties_panel::ui(ui, self.objects_state.selected, &lock.scene, self.locale)
+                let selected_count = viewport::lock_state(&self.viewport).selected_ids().len();
+                properties_panel::ui(
+                    ui,
+                    self.objects_state.selected,
+                    &lock.scene,
+                    self.locale,
+                    selected_count,
+                )
             })
             .inner;
         // Commit this frame's property edits (T16-1 output → the viewport
@@ -829,10 +843,12 @@ impl RoboViewApp {
         // stored rect and pointer, reference plane Z=0 while the grid is
         // shown and the camera-target plane while hidden.
         let pointer_world = viewport::lock_state(&self.viewport).pointer_world();
+        let selected_count = viewport::lock_state(&self.viewport).selected_ids().len();
         let info = StatusInfo {
             loading: self.load.is_some(),
             pointer_world,
             tool: TOOL_NAVIGATE,
+            selected_count,
             messages: &self.messages,
         };
         egui::TopBottomPanel::bottom(egui::Id::new("status_bar"))
@@ -877,6 +893,43 @@ impl RoboViewApp {
 
 impl eframe::App for RoboViewApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // 005 A4: mirror a viewport click-pick onto the tree/properties
+        // selection source within one frame (the viewport reports the pick
+        // at the end of the previous frame; the panels read it now).
+        if let Some(clicked) = viewport::lock_state(&self.viewport).take_click_selection() {
+            // The viewport's click/box resolution mirrors onto the single
+            // selection source the tree and the properties panel read:
+            // the primary (first) of the resolved set (005 A10 keeps the
+            // full set in the viewport, panels downgrade by count).
+            self.objects_state.selected = clicked.first().copied();
+        }
+        // 005 A6/A10 keyboard protocol, gated on "no text widget has focus"
+        // (the A6 focus gate): Esc clears, F frames the selection, Delete
+        // removes it through the same tree action the row menu uses.
+        if !ctx.wants_keyboard_input() {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                viewport::lock_state(&self.viewport).set_selection(&[]);
+                self.objects_state.selected = None;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::F)) {
+                viewport::lock_state(&self.viewport).focus_selection();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+                let ids = viewport::lock_state(&self.viewport).selected_ids();
+                if !ids.is_empty() {
+                    let actions: Vec<ui::objects_panel::TreeAction> = ids
+                        .iter()
+                        .map(|&id| ui::objects_panel::TreeAction::Delete(id))
+                        .collect();
+                    {
+                        let mut lock = viewport::lock_state(&self.viewport);
+                        ui::objects_panel::apply_actions(&mut lock.scene, &actions);
+                        lock.set_selection(&[]);
+                    }
+                    self.objects_state.selected = None;
+                }
+            }
+        }
         // Native macOS menu events (004 T10): drain the bridge queue once
         // per frame and map ids through the single action table — the same
         // dispatch the in-window bar uses.

@@ -116,6 +116,8 @@ use glam::{Mat4, Vec2, Vec3, Vec4, vec2};
 use roboview_core::displays::{self, DisplayKind, DisplayObject, Marker};
 use roboview_core::io;
 use roboview_core::render;
+use roboview_core::render::camera_math::screen_to_ray;
+use roboview_core::render::pick;
 use roboview_core::render::renderer::Appearance;
 use roboview_core::scene::camera::OrbitCamera;
 use roboview_core::scene::{Scene, SceneObject};
@@ -270,6 +272,21 @@ pub struct ViewportState {
     /// from outside this file — the scene API is public — so the pruning is
     /// self-healing, never a hard invariant).
     appearances: HashMap<u64, Appearance>,
+    /// A click-pick reported by the viewport this frame, pending the
+    /// app's mirror onto the tree/properties selection source (005 A4,
+    /// reverse direction of the tree→viewport mirror). `None` is a
+    /// reported "click on empty space" (clears the tree selection), the
+    /// `Option<Option<..>>` layer marks "no report since last take".
+    click_selection: Option<Vec<u64>>,
+    /// Box-select extras beyond the primary (005 A10): multi-select keeps
+    /// the primary in `selected_mirror` and the rest here, so the single
+    /// selection paths (properties mirror, session replay) keep working.
+    /// Empty whenever the selection is a single object.
+    selected_multi: Vec<u64>,
+    /// Start pixel of an in-flight primary-button box drag (005 A9), or
+    /// `None` when no box gesture is active. The rubber band spans from
+    /// here to the current pointer; the camera never moves during it.
+    box_drag_start: Option<Vec2>,
     /// Last selection the viewport mirrored, if any. The per-frame
     /// [`ViewportState::set_selected`] poll compares against it first: an
     /// unchanged selection costs one `Option` compare and writes nothing
@@ -335,6 +352,9 @@ impl ViewportState {
             line_pipeline: None,
             appearances: HashMap::new(),
             selected_mirror: None,
+            click_selection: None,
+            selected_multi: Vec::new(),
+            box_drag_start: None,
             group_default_colors: HashMap::new(),
             // A12 perf-protocol hook (004 T18): ROBOVIEW_DEMO_GRID_OFF=1
             // starts with the ground grid hidden for the on/off comparison.
@@ -406,6 +426,13 @@ impl ViewportState {
         // provisions the upload default appearance, so the session
         // appearance replays right behind it — the registry is read while
         // the scene is borrowed mutably, but the two are disjoint fields.
+        // Multi-select covers more than the legacy single mirror: the
+        // session replay consults the whole set, so precompute it before
+        // the mutable scene borrow.
+        let selected_set = self
+            .selected_ids()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
         for object in self.scene.iter_mut() {
             upload_display(
                 &mut renderer,
@@ -413,9 +440,18 @@ impl ViewportState {
                 &line_pipeline,
                 &mut object.object,
             );
-            if let Some(composite) =
-                session_appearance(&self.appearances, self.selected_mirror, object)
-            {
+            if let Some(composite) = session_appearance(
+                &self.appearances,
+                // Only the flag of this object matters for its
+                // composite; pass it as the single selected id so the
+                // legacy helper stays unambiguous (005 A10 multi-set).
+                if selected_set.contains(&object.id) {
+                    Some(object.id)
+                } else {
+                    None
+                },
+                object,
+            ) {
                 write_appearance_uniform(
                     &renderer,
                     &mesh_pipeline,
@@ -602,15 +638,167 @@ impl ViewportState {
     /// never reuses ids — and override rows of removed objects are pruned
     /// here, so a tree-driven delete needs no registry bookkeeping at its
     /// call site.
+    /// The world-point pick under `cursor` (005 A1/A2): ray from the
+    /// pixel through the scene's visible objects in add order, δ/point
+    /// radius semantics from `render/pick.rs`. `None` when nothing is hit
+    /// (also: a degenerate rect or camera — never panics, spec A5).
+    pub fn pick_at(&self, cursor: Vec2) -> Option<pick::PickHit> {
+        let ctx = self.pick_context()?;
+        let (origin, dir) = screen_to_ray(&ctx.view_proj, ctx.viewport, cursor)?;
+        let objects: Vec<(u64, &roboview_core::displays::DisplayObject)> = self
+            .scene
+            .iter_visible()
+            .map(|o| (o.id, &o.object))
+            .collect();
+        pick::pick_objects(&ctx, origin, dir, &objects)
+    }
+
+    /// Box-select the visible objects whose projected bounds touch `a..b`
+    /// (005 A9, contact semantics) and return their ids in add order.
+    fn box_pick(&self, a: Vec2, b: Vec2) -> Vec<u64> {
+        let Some(ctx) = self.pick_context() else {
+            return Vec::new();
+        };
+        let rect = roboview_core::render::camera_math::Rect2 {
+            min: a.min(b),
+            max: a.max(b),
+        };
+        let objects: Vec<(u64, &roboview_core::displays::DisplayObject)> = self
+            .scene
+            .iter_visible()
+            .map(|o| (o.id, &o.object))
+            .collect();
+        pick::pick_rect(&ctx, rect, &objects)
+    }
+
+    /// Report a viewport resolved selection (click-pick or box-select;
+    /// empty means clear) for the app to mirror onto the tree source.
+    pub fn report_click_selection(&mut self, ids: Vec<u64>) {
+        self.click_selection = Some(ids);
+    }
+
+    /// Take the most recent reported selection, if any since the last take.
+    pub fn take_click_selection(&mut self) -> Option<Vec<u64>> {
+        self.click_selection.take()
+    }
+
+    /// The screen rect of the in-flight box drag (normalized, clamped to
+    /// the viewport), if any — the rubber band the overlay paints.
+    pub fn box_drag_rect(&self, pointer: Vec2) -> Option<(Vec2, Vec2)> {
+        let start = self.box_drag_start?;
+        let a = start.min(pointer);
+        let b = start.max(pointer);
+        let size = Vec2::new(self.viewport_rect.width(), self.viewport_rect.height());
+        let a = Vec2::new(a.x.clamp(0.0, size.x), a.y.clamp(0.0, size.y));
+        let b = Vec2::new(b.x.clamp(0.0, size.x), b.y.clamp(0.0, size.y));
+        Some((a, b))
+    }
+
+    /// The pick context of the current pose (pure viewport geometry — the
+    /// shared construction of the click and box pickers).
+    fn pick_context(&self) -> Option<pick::PickContext> {
+        let size = Vec2::new(self.viewport_rect.width(), self.viewport_rect.height());
+        if size.x <= 0.0 || size.y <= 0.0 {
+            return None;
+        }
+        let view_proj = self.scene.camera.view_proj(self.aspect());
+        Some(pick::PickContext {
+            view_proj,
+            viewport: size,
+            // World length per pixel at one unit of ray depth
+            // (005 plan §3.1): 2·tan(fov/2)/viewport_height.
+            world_per_pixel_scale: 2.0 * (self.scene.camera.vertical_fov() / 2.0).tan() / size.y,
+            // The marker-label font the overlay paints with (paint_label,
+            // 005 pick.rs docs — hit boxes must match the painted pill).
+            font_size_px: 14.0,
+        })
+    }
+
+    /// Set the selection to exactly `ids` (005 A9/A10): the box-select and
+    /// click-pick route. Each transition writes only the uniforms of the
+    /// objects whose flag changed (symmetric difference), so a repeated
+    /// frame with an unchanged set costs an `Option`-compare and writes
+    /// nothing (004 M9/A12).
+    pub fn set_selection(&mut self, ids: &[u64]) {
+        match ids {
+            [] => self.set_selected(None),
+            [single] => self.set_selected(Some(*single)),
+            _ => {
+                // Multi-select: the primary stays in the legacy mirror so
+                // the single-object paths (properties mirror, session
+                // replay, tree focus) keep working; the extras live in
+                // `selected_multi`.
+                let previous: Vec<u64> = self
+                    .selected_mirror
+                    .into_iter()
+                    .chain(self.selected_multi.iter().copied())
+                    .collect();
+                self.selected_mirror = Some(ids[0]);
+                self.selected_multi = ids[1..].to_vec();
+                self.prune_appearance_registry();
+                self.selection_flag_diff(&previous, ids);
+            }
+        }
+    }
+
+    /// Apply the selection flag transitions of the symmetric difference
+    /// between the previous selection and the new one (005 A10 — at most
+    /// one uniform write per affected object).
+    fn selection_flag_diff(&mut self, previous: &[u64], current: &[u64]) {
+        use std::collections::HashSet;
+        let previous_set: HashSet<u64> = previous.iter().copied().collect();
+        let current_set: HashSet<u64> = current.iter().copied().collect();
+        let mut affected: Vec<u64> = previous_set
+            .symmetric_difference(&current_set)
+            .copied()
+            .collect();
+        affected.sort_unstable();
+        for id in affected {
+            self.set_selection_flag(id, current_set.contains(&id));
+        }
+    }
+
+    /// Write one object's selection flag at its current appearance composite
+    /// (the shared-setup invariant the single route relies on, shared by
+    /// the multi diff above).
+    fn set_selection_flag(&mut self, id: u64, is_selected: bool) {
+        let Some(object) = self.scene.get(id) else {
+            return;
+        };
+        let appearance = match self.appearances.get(&id).copied() {
+            Some(entry) => {
+                let next = entry.with_selected(is_selected);
+                if next != entry {
+                    // Registry rows always carry the current selection
+                    // bit, so a replay writes the composite exactly as
+                    // stored.
+                    self.appearances.insert(id, next);
+                }
+                next
+            }
+            None => {
+                // No override active: the uniform holds the upload
+                // default plus the flag of the last mirror. Write the
+                // flag transition — for a face-carrying mesh this also
+                // restores its baked albedo when the selection leaves
+                // it, which is exactly why the entry-less composite is
+                // the upload default, not an all-zero albedo.
+                upload_default_appearance(&object.object).with_selected(is_selected)
+            }
+        };
+        self.push_appearance_uniform(id, &appearance);
+    }
+
     pub fn set_selected(&mut self, selected: Option<u64>) {
         // An id that left the scene cannot be selected: normalize it to a
         // deselection. The mirror stores only normalized values.
         let selected = selected.filter(|id| self.scene.get(*id).is_some());
-        if self.selected_mirror == selected {
+        if self.selected_mirror == selected && self.selected_multi.is_empty() {
             return;
         }
         let previous = self.selected_mirror;
         self.selected_mirror = selected;
+        self.selected_multi.clear();
         self.prune_appearance_registry();
         // Only the two affected objects can differ from their current
         // uniform state — every other object's flag is already the one it
@@ -619,33 +807,93 @@ impl ViewportState {
             let Some(id) = candidate else {
                 continue;
             };
+            self.set_selection_flag(id, selected == Some(id));
+        }
+    }
+
+    /// Merge box/click hits with the existing selection per the 005 A10
+    /// modifier protocol: shift adds, ctrl subtracts, neither replaces.
+    /// The ambiguous shift+ctrl combo replaces (deterministic).
+    fn mix_selection(&self, hits: &[u64], add: bool, subtract: bool) -> Vec<u64> {
+        let current = self.selected_ids();
+        if add && subtract {
+            return hits.to_vec();
+        }
+        if add {
+            let mut merged = current;
+            for id in hits {
+                if !merged.contains(id) {
+                    merged.push(*id);
+                }
+            }
+            return merged;
+        }
+        if subtract {
+            return current
+                .into_iter()
+                .filter(|id| !hits.contains(id))
+                .collect();
+        }
+        hits.to_vec()
+    }
+
+    /// Combined world bounds of the selection (005 A6): the bounds of the
+    /// data-backed objects, folded with the anchor points of frames and
+    /// markers (which report no bounds). `None` with an empty selection.
+    fn selection_bounds(&self) -> Option<io::Aabb> {
+        let mut merged: Option<io::Aabb> = None;
+        let mut merge = |a: io::Aabb| {
+            merged = Some(match merged {
+                Some(m) => io::Aabb {
+                    min: m.min.min(a.min),
+                    max: m.max.max(a.max),
+                },
+                None => a,
+            });
+        };
+        for id in self.selected_ids() {
             let Some(object) = self.scene.get(id) else {
                 continue;
             };
-            let is_selected = selected == Some(id);
-            let appearance = match self.appearances.get(&id).copied() {
-                Some(entry) => {
-                    let next = entry.with_selected(is_selected);
-                    if next != entry {
-                        // Registry rows always carry the current selection
-                        // bit, so a replay writes the composite exactly as
-                        // stored.
-                        self.appearances.insert(id, next);
-                    }
-                    next
-                }
+            match object.object.bounds() {
+                Some(bounds) => merge(bounds),
                 None => {
-                    // No override active: the uniform holds the upload
-                    // default plus the flag of the last mirror. Write the
-                    // flag transition — for a face-carrying mesh this also
-                    // restores its baked albedo when the selection leaves
-                    // it, which is exactly why the entry-less composite is
-                    // the upload default, not an all-zero albedo.
-                    upload_default_appearance(&object.object).with_selected(is_selected)
+                    let anchor = match &object.object {
+                        roboview_core::displays::DisplayObject::Frame(frame) => Some(frame.origin),
+                        roboview_core::displays::DisplayObject::Marker(marker) => match marker {
+                            roboview_core::displays::Marker::Text(text) => Some(text.anchor),
+                            roboview_core::displays::Marker::Arrow(arrow) => Some(arrow.start),
+                        },
+                        _ => None,
+                    };
+                    if let Some(point) = anchor {
+                        merge(io::Aabb {
+                            min: point,
+                            max: point,
+                        });
+                    }
                 }
-            };
-            self.push_appearance_uniform(id, &appearance);
+            }
         }
+        merged
+    }
+
+    /// 005 A6: focus the camera on the selection — framing to the combined
+    /// bounds (or anchor points); with an empty selection this is a no-op.
+    pub fn focus_selection(&mut self) {
+        let Some(bounds) = self.selection_bounds() else {
+            return;
+        };
+        self.scene.camera = roboview_core::scene::camera::OrbitCamera::framing(Some(&bounds));
+    }
+
+    /// The ids of the current selection (primary first, then the extras),
+    /// in the order the selection was resolved.
+    pub fn selected_ids(&self) -> Vec<u64> {
+        self.selected_mirror
+            .into_iter()
+            .chain(self.selected_multi.iter().copied())
+            .collect()
     }
 
     /// Commit one batch of field edits to a single scene object (004 spec
@@ -840,10 +1088,18 @@ impl ViewportState {
             };
             upload_display(renderer, mesh_pipeline, line_pipeline, &mut object.object);
         }
-        let composite = self
-            .scene
-            .get(id)
-            .and_then(|object| session_appearance(&self.appearances, self.selected_mirror, object));
+        let selected_set = self
+            .selected_ids()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let composite = self.scene.get(id).and_then(|object| {
+            let selected = if selected_set.contains(&object.id) {
+                Some(object.id)
+            } else {
+                None
+            };
+            session_appearance(&self.appearances, selected, object)
+        });
         if let Some(composite) = composite {
             self.push_appearance_uniform(id, &composite);
         }
@@ -1488,6 +1744,66 @@ pub fn show_viewport(
                 rect,
                 &mut viewport.scene.camera,
             );
+            // 005 A9/A11: left click = pick (egui's click means the press
+            // never crossed the drag threshold — below 4 px, so the same
+            // button's drag stays box-select); a hit highlights at once
+            // through the appearance channel and the app mirrors it.
+            if response.clicked() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let cursor = Vec2::new(pos.x - rect.min.x, pos.y - rect.min.y);
+                    let (add, subtract) = ui.ctx().input(|i| (i.modifiers.shift, i.modifiers.ctrl));
+                    let clicked = {
+                        let mut viewport = lock_state(state);
+                        let clicked = viewport.pick_at(cursor).map(|hit| hit.id);
+                        let ids = viewport.mix_selection(
+                            &clicked.into_iter().collect::<Vec<_>>(),
+                            add,
+                            subtract,
+                        );
+                        viewport.set_selection(&ids);
+                        ids
+                    };
+                    lock_state(state).report_click_selection(clicked);
+                }
+            }
+            // 005 A9: primary drag = box-select behind the pointer
+            // threshold; the camera is frozen for its duration (the drag
+            // never reaches camera_input) and the rubber band is painted
+            // by the overlay pass.
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    lock_state(state).box_drag_start =
+                        Some(Vec2::new(pos.x - rect.min.x, pos.y - rect.min.y));
+                }
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                let (start, ids) = {
+                    let mut viewport = lock_state(state);
+                    let start = viewport.box_drag_start.take();
+                    let ids = start
+                        .map(|s| {
+                            let now = Vec2::new(rect.max.x - rect.min.x, rect.max.y - rect.min.y);
+                            // The stopped pointer position is the last
+                            // interact position of this drag.
+                            let end = response
+                                .interact_pointer_pos()
+                                .map(|p| Vec2::new(p.x - rect.min.x, p.y - rect.min.y))
+                                .unwrap_or(now);
+                            let hits = viewport.box_pick(s, end);
+                            let (add, subtract) =
+                                ui.ctx().input(|i| (i.modifiers.shift, i.modifiers.ctrl));
+                            viewport.mix_selection(&hits, add, subtract)
+                        })
+                        .unwrap_or_default();
+                    (start, ids)
+                };
+                if start.is_some() {
+                    lock_state(state).set_selection(&ids);
+                    lock_state(state).report_click_selection(ids);
+                    lock_state(state).box_drag_start = None;
+                    ui.ctx().request_repaint();
+                }
+            }
         }
         (scene_empty, has_content)
     };
@@ -1512,6 +1828,12 @@ pub fn show_viewport(
         paint_labels(&painter, rect, state);
         paint_origin_axis_labels(&painter, rect, state);
         paint_indicator(&painter, rect, state);
+
+        // 005 A9: the box-select rubber band, painted after the 3D
+        // callback like the labels so it always sits on top — a thin
+        // select-highlight outline with a translucent interior.
+        let hover = ui.ctx().input(|i| i.pointer.hover_pos());
+        paint_box_band(&painter, rect, state, hover);
     }
 
     // Corner HUD switches of the helper layer (spec §6: the toolbar
@@ -1627,6 +1949,45 @@ fn paint_labels(painter: &egui::Painter, rect: egui::Rect, state: &Arc<Mutex<Vie
             _ => {}
         }
     }
+}
+
+/// Paint the box-select rubber band (005 A9): the normalized drag rect
+/// from the state, drawn with the selection-highlight token so it matches
+/// the pick highlight response; the interior is translucent and never
+/// blocks the 3D content (it is painted with the egui painter, not the
+/// scene graph).
+fn paint_box_band(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    state: &Arc<Mutex<ViewportState>>,
+    hover: Option<egui::Pos2>,
+) {
+    let Some(hover) = hover else {
+        return;
+    };
+    let pointer = Vec2::new(hover.x - rect.min.x, hover.y - rect.min.y);
+    let Some((a, b)) = lock_state(state).box_drag_rect(pointer) else {
+        return;
+    };
+    let band = egui::Rect::from_min_max(
+        egui::pos2(a.x + rect.min.x, a.y + rect.min.y),
+        egui::pos2(b.x + rect.min.x, b.y + rect.min.y),
+    );
+    // The selection-highlight token (theme::SELECT_HIGHLIGHT, spec A9
+    // palette) is shared with the pick highlight; the interior is
+    // translucent so the scene stays readable under the band.
+    let (r, g, b) = (255, 128, 0);
+    painter.rect_filled(
+        band,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(r, g, b, 31),
+    );
+    painter.rect_stroke(
+        band,
+        0.0,
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(r, g, b, 204)),
+        egui::StrokeKind::Inside,
+    );
 }
 
 /// Paint the orientation indicator in the top-right corner of the

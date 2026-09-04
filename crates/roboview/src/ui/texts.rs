@@ -158,6 +158,8 @@ pub enum TextKey {
     ViewportEmptyHint,
     /// Shown in the viewport while a file loads in the background.
     ViewportLoading,
+    /// Status-bar multi-selection segment: "{count}" objects selected.
+    StatusSelectedCount,
     // Objects panel (ui/objects_panel.rs).
     /// Heading of the fixed objects panel (the left sidebar list).
     ObjectsPanelTitle,
@@ -328,6 +330,7 @@ impl TextKey {
         TextKey::FileDialogFilterPath,
         TextKey::ViewportEmptyHint,
         TextKey::ViewportLoading,
+        TextKey::StatusSelectedCount,
         TextKey::ObjectsPanelTitle,
         TextKey::ObjectsFit,
         TextKey::ObjectsFitTooltip,
@@ -414,6 +417,7 @@ static EN: &[(TextKey, &str)] = &[
         "The scene is empty. Open a file, or add a frame or marker to begin.",
     ),
     (TextKey::ViewportLoading, "Loading…"),
+    (TextKey::StatusSelectedCount, "{count} objects selected"),
     // Objects panel.
     (TextKey::ObjectsPanelTitle, "Objects"),
     (TextKey::ObjectsFit, "Fit"),
@@ -558,6 +562,7 @@ static ZH: &[(TextKey, &str)] = &[
         "场景为空。打开文件，或添加坐标架或标记以开始。",
     ),
     (TextKey::ViewportLoading, "正在加载…"),
+    (TextKey::StatusSelectedCount, "已选 {count} 个对象"),
     // Objects panel.
     (TextKey::ObjectsPanelTitle, "对象"),
     (TextKey::ObjectsFit, "适配"),
@@ -1176,6 +1181,14 @@ pub fn prop_label_length(locale: Locale) -> &'static str {
 
 /// Segment label of the frames-per-second readout.
 #[allow(dead_code)]
+/// Status-bar segment: "{count}" objects currently selected (005 A10).
+pub fn selection_count(locale: Locale, count: usize) -> String {
+    interpolate(
+        resolve(locale, TextKey::StatusSelectedCount),
+        &[("count", &count.to_string())],
+    )
+}
+
 pub fn status_fps(locale: Locale) -> &'static str {
     resolve(locale, TextKey::StatusFps)
 }

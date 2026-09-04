@@ -1,13 +1,18 @@
 //! Pointer input → camera deltas for the 3D viewport.
 //!
-//! A thin adapter between egui input events and [`OrbitCamera`] (plan §4,
-//! §6): it owns no state, only maps one frame of events onto incremental
-//! camera updates with "grab the cloud" feel — the content tracks the
-//! pointer, the mapping used by OrbitControls-style viewers:
+//! A thin adapter between egui input events and [`OrbitCamera`] (005
+//! spec keymap A11): it owns no state, only maps one frame of events onto
+//! incremental camera updates with "grab the cloud" feel — the content
+//! tracks the pointer, the pro-tools mapping (005 approved 2026-09-04):
 //!
-//! - primary-button drag orbits the cloud around the camera target;
-//! - scroll zooms in on wheel-up / two-finger-up, out on the reverse;
-//! - middle-button drag pans the cloud in the screen plane.
+//! - middle-button drag orbits the cloud around the camera target;
+//! - shift + middle drag pans the cloud in the screen plane;
+//! - scroll zooms in on wheel-up / two-finger-up, out on the reverse,
+//!   **anchored at the cursor** (the world point under the pointer stays
+//!   put — [`OrbitCamera`] zoom would swing the scene around its target
+//!   plane instead, 005 A11);
+//! - the primary button is NOT a camera gesture: viewport picking/box
+//!   select owns it (005 A9/A11), this adapter never consumes it.
 //!
 //! Sign conventions, from the camera's point of view (right-handed, +Y up,
 //! screen right == camera right at rest; see the core camera docs):
@@ -19,8 +24,11 @@
 //!   the eye rises, i.e. the pitch delta is `+dy`. The vertical axis is
 //!   flipped on the way in because egui's +Y points down while the camera's
 //!   pitch grows upward.
-//! - Scrolling zooms around the target: `zoom(+1)` halves the eye-to-target
-//!   distance, so a positive (upward) scroll delta zooms in.
+//! - Scrolling zooms around the cursor: `zoom(+1)` halves the eye-to-target
+//!   distance, so a positive (upward) scroll delta zooms in; the target is
+//!   then re-anchored along its focal plane so the world point under the
+//!   cursor keeps its pixel (005 A11, drift ≤ 0.5 % of the viewport height,
+//!   asserted by `cursor_zoom` unit tests).
 //! - Panning translates the camera target; to make the content follow a
 //!   drag to the right the target moves one screen step to the left, and a
 //!   downward drag lifts the target. [`OrbitCamera::pan`] already maps
@@ -32,6 +40,7 @@
 //! camera (the core rolls back internally as well, spec A6).
 
 use eframe::egui;
+use glam::Vec2;
 
 use roboview_core::scene::camera::OrbitCamera;
 
@@ -66,38 +75,164 @@ fn focal_plane_track_factor() -> f32 {
 ///
 /// Call once per frame while the viewport is the panel under the pointer.
 /// Drag deltas arrive per frame, so repeated calls integrate smoothly into
-/// a continuous gesture.
+/// a continuous gesture. The primary button is deliberately left alone:
+/// picking and box-select own it (005 A9).
 pub fn apply_pointer_events(
     response: &egui::Response,
     ctx: &egui::Context,
     viewport: egui::Rect,
     camera: &mut OrbitCamera,
 ) {
-    if response.dragged_by(egui::PointerButton::Primary) {
-        let drag = response.drag_delta();
-        if drag.x.is_finite() && drag.y.is_finite() {
-            camera.orbit(
-                -drag.x * ORBIT_RADIANS_PER_POINT,
-                drag.y * ORBIT_RADIANS_PER_POINT,
-            );
-        }
-    }
+    let shift = ctx.input(|input| input.modifiers.shift);
 
     if response.dragged_by(egui::PointerButton::Middle) {
         let drag = response.drag_delta();
-        let height = viewport.height();
-        if drag.x.is_finite() && drag.y.is_finite() && height.is_finite() && height > 0.0 {
-            // +Y is down in egui but up in the camera world: negate the
-            // horizontal axis (content follows), keep the vertical one.
-            let scale = focal_plane_track_factor() / height;
-            camera.pan(glam::Vec2::new(-drag.x * scale, drag.y * scale));
+        // Shift + middle-drag pans (005 A11); plain middle-drag orbits —
+        // the pro-tools convention, so the left button is free for
+        // selection.
+        if shift {
+            let height = viewport.height();
+            if drag.x.is_finite() && drag.y.is_finite() && height.is_finite() && height > 0.0 {
+                // +Y is down in egui but up in the camera world: negate the
+                // horizontal axis (content follows), keep the vertical one.
+                let scale = focal_plane_track_factor() / height;
+                camera.pan(glam::Vec2::new(-drag.x * scale, drag.y * scale));
+            }
+        } else {
+            if drag.x.is_finite() && drag.y.is_finite() {
+                camera.orbit(
+                    -drag.x * ORBIT_RADIANS_PER_POINT,
+                    drag.y * ORBIT_RADIANS_PER_POINT,
+                );
+            }
         }
     }
 
     if response.hovered() && !ctx.wants_pointer_input() {
         let scroll = ctx.input(|input| input.raw_scroll_delta.y);
         if scroll.is_finite() && scroll != 0.0 {
-            camera.zoom(scroll * ZOOM_LOG2_PER_SCROLL_POINT);
+            // Cursor-anchored zoom (005 A11): the world point under the
+            // pointer keeps its pixel.
+            let cursor_px = response
+                .hover_pos()
+                .map(|p| Vec2::new(p.x - viewport.min.x, p.y - viewport.min.y))
+                .unwrap_or_else(|| Vec2::ZERO);
+            let aspect = viewport.width() / viewport.height();
+            cursor_zoom(
+                camera,
+                aspect,
+                Vec2::new(viewport.width(), viewport.height()),
+                cursor_px,
+                scroll * ZOOM_LOG2_PER_SCROLL_POINT,
+            );
         }
+    }
+}
+
+/// Cursor-anchored zoom: `camera.zoom(delta)`, then move the target along
+/// its focal plane so the world point under `cursor_px` keeps its pixel
+/// (005 A11 — drift ≤ 0.5 % of the viewport height). Pure math on the
+/// camera, unit-testable headless.
+///
+/// When the world point under the cursor sits on the wrong side of the
+/// zoom state (behind the eye, outside the clip volume, or the distance
+/// clamps saturate the zoom), the correction is skipped and the plain
+/// zoom stands — a degraded-but-continuous gesture instead of a jump.
+pub(crate) fn cursor_zoom(
+    camera: &mut OrbitCamera,
+    aspect: f32,
+    viewport_px: Vec2,
+    cursor_px: Vec2,
+    delta: f32,
+) {
+    let before_vp = camera.view_proj(aspect);
+    let Some(anchor) = roboview_core::render::camera_math::pointer_world(
+        &before_vp,
+        viewport_px,
+        cursor_px,
+        roboview_core::render::camera_math::WorldPlane::CameraTargetPlane,
+    ) else {
+        return;
+    };
+    camera.zoom(delta);
+    let after_vp = camera.view_proj(aspect);
+    let Some(offset_px) = roboview_core::render::camera_math::zoom_cursor_screen_offset(
+        &after_vp,
+        viewport_px,
+        anchor,
+        cursor_px,
+    ) else {
+        return;
+    };
+    let k = focal_plane_track_factor() / viewport_px.y;
+    // Screen offset → focal-plane target shift: x along camera-right
+    // (negated: bring the image back to the cursor), y along screen-up
+    // (egui y is down, so the pan y flips once more).
+    camera.pan(glam::Vec2::new(-offset_px.x * k, offset_px.y * k));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::Vec3;
+    use roboview_core::render::camera_math::{WorldPlane, anchor_to_screen, pointer_world};
+
+    /// Re-project the world point the camera currently puts under
+    /// `cursor_px` and measure how far it has drifted from that pixel.
+    fn cursor_drift_px(camera: &OrbitCamera, viewport: Vec2, cursor_px: Vec2) -> f32 {
+        let vp = camera.view_proj(viewport.x / viewport.y);
+        let Some(w) = pointer_world(&vp, viewport, cursor_px, WorldPlane::CameraTargetPlane) else {
+            return f32::INFINITY;
+        };
+        let Some(px) = anchor_to_screen(&vp, viewport, w) else {
+            return f32::INFINITY;
+        };
+        (px - cursor_px).length()
+    }
+
+    #[test]
+    fn cursor_zoom_keeps_the_world_point_under_the_pointer() {
+        // 005 A11: zoom must anchor at the cursor — the world point under
+        // the pointer stays within 0.5 % of the viewport height of its
+        // pixel, for every reasonable cursor and zoom step in/out.
+        let viewport = Vec2::new(800.0, 600.0);
+        let cursors = [
+            Vec2::new(400.0, 300.0),
+            Vec2::new(520.0, 180.0),
+            Vec2::new(30.0, 580.0),
+        ];
+        let deltas = [1.5, -1.5, 0.25, -3.0, 1000.0, -1000.0];
+        for aspect in [1.0_f32, 4.0 / 3.0] {
+            for cursor in cursors {
+                for delta in deltas {
+                    let mut camera = OrbitCamera::new(Vec3::ZERO);
+                    cursor_zoom(&mut camera, aspect, viewport, cursor, delta);
+                    let drift = cursor_drift_px(&camera, viewport, cursor);
+                    assert!(
+                        drift <= 0.005 * viewport.y,
+                        "aspect {aspect} cursor {cursor:?} delta {delta}: drift {drift}px"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_zoom_is_headless_and_degenerate_safe() {
+        let mut camera = OrbitCamera::new(Vec3::ZERO);
+        let viewport = Vec2::new(800.0, 600.0);
+        // Non-finite inputs never panic and never move the camera (the
+        // camera's own rollbacks cover the zoom; the cursor math skips).
+        cursor_zoom(&mut camera, 1.0, viewport, Vec2::new(f32::NAN, 300.0), 1.0);
+        cursor_zoom(
+            &mut camera,
+            1.0,
+            viewport,
+            Vec2::new(400.0, 300.0),
+            f32::NAN,
+        );
+        cursor_zoom(&mut camera, 1.0, viewport, Vec2::new(400.0, 300.0), 0.0);
+        // A degenerate viewport (hidden window) stays a no-op too.
+        cursor_zoom(&mut camera, 1.0, Vec2::new(0.0, 0.0), Vec2::ZERO, 1.0);
     }
 }

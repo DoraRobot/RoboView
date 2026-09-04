@@ -152,11 +152,21 @@ pub fn ui(
     selected: Option<u64>,
     scene: &Scene<DisplayObject>,
     locale: Locale,
+    selected_count: usize,
 ) -> PropertiesOutput {
     // The panel's session memory (text drafts, color mirror) rides in
     // egui's temporary data: those values live until egui shuts down and
     // are never serialized (egui util/id_type_map.rs) — the panel needs no
     // caller-owned state to hold an editor buffer between frames.
+    // 005 A10: a multi-selection degrades the panel to a summary — the
+    // single-object editing contract of 004 A3 applies to exactly one
+    // selected object; nothing text-based is edited while N > 1.
+    if selected_count > 1 {
+        ui.horizontal(|ui| {
+            ui.label(texts::selection_count(locale, selected_count));
+        });
+        return PropertiesOutput { edits: Vec::new() };
+    }
     let memory_key = egui::Id::new("properties_panel.memory");
     let mut memory = ui
         .data(|data| data.get_temp::<PanelMemory>(memory_key))

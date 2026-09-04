@@ -397,6 +397,7 @@ pub fn ui(
     state: &mut ObjectsPanelState,
     scene: &Scene<DisplayObject>,
     locale: Locale,
+    selected_ids: &[u64],
 ) -> ObjectsPanelOutput {
     let rows = rows_from_scene(scene);
     // The Fit enablement is a scene read (bounds union over the measurable
@@ -413,6 +414,7 @@ pub fn ui(
         can_fit,
         add_defaults(bounds),
         locale,
+        selected_ids,
         &mut output,
     );
     output
@@ -421,6 +423,9 @@ pub fn ui(
 /// The shared panel chrome and tree body: the heading, the action row, the
 /// inline Add form while one is open, the search field, and the grouped
 /// tree (or its hints).
+/// 8 parameters: the two 005 multi-selection contexts (primary + set) are
+/// deliberately threaded, not bundled, to keep the tree reads local.
+#[allow(clippy::too_many_arguments)]
 fn panel_body(
     ui: &mut egui::Ui,
     state: &mut ObjectsPanelState,
@@ -428,6 +433,7 @@ fn panel_body(
     can_fit: bool,
     defaults: (Vec3, f32),
     locale: Locale,
+    selected_ids: &[u64],
     output: &mut ObjectsPanelOutput,
 ) {
     ui.add_space(4.0);
@@ -479,7 +485,7 @@ fn panel_body(
         add_form_ui(ui, state, locale, output);
     }
     ui.add_space(6.0);
-    tree_section(ui, state, rows, locale, output);
+    tree_section(ui, state, rows, locale, selected_ids, output);
 
     // Refresh the Enter key-repeat latch of the inline form's Enter-to-add
     // every frame — also while no form is open, so a held Enter never
@@ -496,6 +502,7 @@ fn tree_section(
     state: &mut ObjectsPanelState,
     rows: &[Row],
     locale: Locale,
+    selected_ids: &[u64],
     output: &mut ObjectsPanelOutput,
 ) {
     // Drop state that points at objects that vanished this frame.
@@ -551,7 +558,7 @@ fn tree_section(
                 group_header_ui(ui, state, kind, members.len(), collapsed, locale);
                 if !collapsed {
                     for row in members {
-                        member_row_ui(ui, state, row, locale, output);
+                        member_row_ui(ui, state, row, locale, selected_ids, output);
                     }
                 }
             }
@@ -699,6 +706,7 @@ fn member_row_ui(
     state: &mut ObjectsPanelState,
     row: &Row,
     locale: Locale,
+    selected_ids: &[u64],
     output: &mut ObjectsPanelOutput,
 ) {
     let renaming = state.renaming == Some(row.id);
@@ -712,7 +720,10 @@ fn member_row_ui(
     if response.clicked() || response.secondary_clicked() {
         state.selected = Some(row.id);
     }
-    paint_row_background(ui, rect, state.selected == Some(row.id), response.hovered());
+    // 005 A10: a row is highlighted by the tree's own single selection or
+    // by the viewport's multi-selection set.
+    let is_selected = state.selected == Some(row.id) || selected_ids.contains(&row.id);
+    paint_row_background(ui, rect, is_selected, response.hovered());
 
     let mut inner = ui.new_child(
         egui::UiBuilder::new()

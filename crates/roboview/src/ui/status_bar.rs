@@ -208,6 +208,8 @@ impl StatusBar {
                 None => NO_FPS.to_owned(),
             };
             let fps_text = format!("{}: {fps_value}", texts::status_fps(locale));
+            let selection_text = (info.selected_count > 1)
+                .then(|| texts::selection_count(locale, info.selected_count));
 
             // Row budget: the fixed segments measured, the message strip
             // gets everything that remains (down to its minimum width), and
@@ -219,12 +221,21 @@ impl StatusBar {
             } else {
                 0.0
             };
+            let sel_w = selection_text
+                .as_ref()
+                .map_or(0.0, |text| text_width(ui, text));
             let core_w = text_width(ui, state_text)
                 + tool_w
+                + sel_w
                 + text_width(ui, &coords_text)
                 + text_width(ui, &fps_text);
-            // Children of the row: [strip][state][tool][slack][coords][fps].
+            // Children of the row: [strip][state][tool][selected][slack]
+            // [coords][fps] — the counter only appears during a
+            // multi-selection (005 A10).
             let mut children = if has_tool { 5 } else { 4 };
+            if selection_text.is_some() {
+                children += 1;
+            }
             let mut strip_w = 0.0;
             if !info.messages.is_empty() {
                 let free = ui.available_width() - core_w - spacing * children as f32;
@@ -242,6 +253,9 @@ impl StatusBar {
             ui.label(state_text);
             if has_tool {
                 ui.label(egui::RichText::new(info.tool).color(ui.visuals().weak_text_color()));
+            }
+            if let Some(text) = &selection_text {
+                ui.label(egui::RichText::new(text).color(ui.visuals().weak_text_color()));
             }
             // The slack child centers the coordinate segment between the
             // leading cluster and the FPS segment (zero when messages take
@@ -327,6 +341,9 @@ pub struct StatusInfo<'a> {
     /// Current tool hint ([`TOOL_NAVIGATE`] in 004, until a tool state
     /// exists); an empty string hides the segment.
     pub tool: &'a str,
+    /// Size of the current multi-selection (005 A10); 0 and 1 hide the
+    /// segment — a single selected object needs no counter.
+    pub selected_count: usize,
     /// The app's message log, oldest first; the strip picks the most recent
     /// [`MAX_VISIBLE_MESSAGES`].
     pub messages: &'a [MessageItem],
@@ -681,6 +698,7 @@ mod tests {
                     loading,
                     pointer_world,
                     tool,
+                    selected_count: 0,
                     messages,
                 };
                 bar.ui(ui, locale, &info);
