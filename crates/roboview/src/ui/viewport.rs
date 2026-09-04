@@ -319,6 +319,11 @@ pub struct ViewportState {
     /// renderer rebuild — their bind groups reference the old renderer's
     /// layout — and re-provisioned by the next prepare.
     axes_meshes: Option<[render::LineMesh; 3]>,
+    /// The axis reference lines through the origin (004 revision 2026-09-05:
+    /// Blender-style axis lines) — one long segment per axis, clipped to
+    /// the visible ground window like the grid, refreshed with it. Painted
+    /// with the same 002 semantic colors, under the same `axes_on` switch.
+    axis_lines: Option<[render::LineMesh; 3]>,
     /// View-projection of the last grid refresh — the refresh key. A
     /// bitwise-equal `view_proj` means the identical window and strips, so
     /// nothing regenerates while the camera sits still (A11: no crawl, no
@@ -362,6 +367,7 @@ impl ViewportState {
             axes_on: true,
             grid_mesh: None,
             axes_meshes: None,
+            axis_lines: None,
             grid_refresh_key: None,
             pointer_hover: None,
             viewport_rect: egui::Rect::NOTHING,
@@ -467,6 +473,7 @@ impl ViewportState {
         // re-provisions and refreshes them lazily.
         self.grid_mesh = None;
         self.axes_meshes = None;
+        self.axis_lines = None;
         self.grid_refresh_key = None;
         self.renderer = Some(renderer);
         self.mesh_pipeline = Some(mesh_pipeline);
@@ -1171,9 +1178,20 @@ impl ViewportState {
     /// writes the mesh's own buffers in place (zero allocation, and never
     /// through the upload ledger, A6).
     fn refresh_helper_layer(&mut self) {
-        let Some(line_pipeline) = self.line_pipeline.as_ref() else {
+        // The pipeline is taken out while the layer mutates itself through
+        // methods — and put back untouched afterwards. That sidesteps the
+        // "self.line_pipeline borrowed while self borrowed mutably" split
+        // that the refresh calls otherwise trip (safe: the slot is
+        // restored on every exit path).
+        let mut slot = self.line_pipeline.take();
+        let Some(line_pipeline) = slot.as_mut() else {
             return;
         };
+        self.refresh_helper_layer_with(line_pipeline);
+        self.line_pipeline = slot;
+    }
+
+    fn refresh_helper_layer_with(&mut self, line_pipeline: &mut render::line::LinePipeline) {
         // World-origin axes: three one-segment meshes at the fixed length.
         // World-fixed geometry needs no camera refresh, so this runs once
         // per renderer lifetime.
@@ -1190,7 +1208,7 @@ impl ViewportState {
             }
             self.axes_meshes = Some(meshes);
         }
-        if !self.grid_on {
+        if !self.grid_on && !self.axes_on {
             return;
         }
         let view_proj = self.scene.camera.view_proj(self.aspect());
@@ -1212,9 +1230,69 @@ impl ViewportState {
             let mesh = line_pipeline.with_capacity(render::grid::segment_capacity_bound(&options));
             self.grid_mesh = Some(mesh);
         }
-        let Some(window) = grid_window(&view_proj, self.viewport_size()) else {
+        let window = grid_window(&view_proj, self.viewport_size());
+        if self.grid_on {
+            let Some(window) = window else {
+                // The grid stays off-view; the axis lines refresh with the
+                // same key below regardless (their own motion depends on
+                // the same window).
+                self.refresh_axis_lines(line_pipeline, None);
+                return;
+            };
+            self.refresh_grid_mesh(line_pipeline, window);
+            self.refresh_axis_lines(line_pipeline, Some(window));
+        } else {
+            self.refresh_axis_lines(line_pipeline, window);
+        }
+    }
+
+    /// Refresh the through-origin axis reference lines (004 revision
+    /// 2026-09-05, Blender-style): one segment per axis spanning the
+    /// visible ground window, so X (red) and Y (green) cross the whole
+    /// ground like Blender's axis lines; Z (blue) uses the same extent.
+    /// Runs under the grid refresh key (any camera move), lazily on the
+    /// first axes-on frame.
+    fn refresh_axis_lines(
+        &mut self,
+        line_pipeline: &mut render::line::LinePipeline,
+        window: Option<GridWindow>,
+    ) {
+        let (axis_x, axis_y, axis_z) = theme::ORIGIN_AXIS;
+        let axes = [(Vec3::X, axis_x), (Vec3::Y, axis_y), (Vec3::Z, axis_z)];
+        if self.axis_lines.is_none() {
+            self.axis_lines = Some([
+                line_pipeline.with_capacity(1),
+                line_pipeline.with_capacity(1),
+                line_pipeline.with_capacity(1),
+            ]);
+        }
+        let Some(window) = window else {
+            // Off-view ground: the old lines stay (they are off-view too).
             return;
         };
+        let r = window.radius;
+        let segs = [
+            Vec3::new(-r, 0.0, 0.0)..Vec3::new(r, 0.0, 0.0),
+            Vec3::new(0.0, -r, 0.0)..Vec3::new(0.0, r, 0.0),
+            Vec3::new(0.0, 0.0, -r)..Vec3::new(0.0, 0.0, r),
+        ];
+        for (i, (_, color)) in axes.iter().enumerate() {
+            let Some(mesh) = self.axis_lines.as_mut().map(|m| &mut m[i]) else {
+                return;
+            };
+            let seg = [segs[i].start, segs[i].end];
+            line_pipeline.update_mesh(mesh, &[seg], *color);
+        }
+    }
+
+    /// Refresh the persistent ground grid (capacity prebuild + in-place
+    /// update_mesh) for the current pose; `window` is the fresh visible-
+    /// ground window.
+    fn refresh_grid_mesh(
+        &mut self,
+        line_pipeline: &mut render::line::LinePipeline,
+        window: GridWindow,
+    ) {
         // Pixels-per-meter at the camera-target plane: the zoom metric of
         // the step ladder. It depends on the eye-to-target distance (and
         // the FOV/viewport) only, never on pitch or yaw — so rotating the
@@ -1676,6 +1754,17 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         {
             for axis in axes {
                 line_pipeline.paint(render_pass, axis);
+            }
+        }
+        // The through-origin axis reference lines (Blender-style, 004
+        // revision 2026-09-05) paint right after the origin short axes,
+        // same semantic colors, same switch — long X/Y lines crossing the
+        // whole ground beside the short labels.
+        if state.axes_on
+            && let Some(lines) = state.axis_lines.as_ref()
+        {
+            for line in lines {
+                line_pipeline.paint(render_pass, line);
             }
         }
         // Pass 3b — the scene's line geometry: paths, frames, and marker
