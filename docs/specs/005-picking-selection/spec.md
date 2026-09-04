@@ -1,6 +1,6 @@
 # picking-selection — 规格
 
-状态：Draft（草案）
+状态：Approved（批准）
 
 日期：2026-09-02
 
