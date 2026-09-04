@@ -44,12 +44,14 @@
 //! projection fact, not a density change).
 //!
 //! The generation window (`center ± radius`, the visible-ground measure)
-//! is additionally clamped to `250·step`: without alpha blending nothing
+//! is additionally clamped to `5000·step`: without alpha blending nothing
 //! can fade on the GPU, so the far end of a horizon-grazing view is cut
-//! at the same bound the readability gate uses — the no-alpha equivalent
-//! of Blender's floor-grid distance fade. The clamp also keeps the
-//! per-axis line count ≤ 2·250 + 1 for any pose (`segment_capacity_bound`
-//! is unchanged).
+//! at the bound where the lines fuse into a uniform gray — the no-alpha
+//! equivalent of Blender's floor-grid distance fade (~5 km at 1 m step,
+//! widened from 250 m after the owner's 2026-09-05 axis-row feedback:
+//! the tiny window made the colored rows pop away on pan/zoom). The
+//! clamp also keeps the per-axis line count ≤ 2·5000 + 1 for any pose
+//! (`segment_capacity_bound` follows).
 //!
 //! # Step switches are discrete "pops", never crawling (A11)
 //!
@@ -66,10 +68,10 @@
 //! Returns axis-aligned `[Vec3; 2]` segments on Z=0 (each ordered low→high
 //! along its axis), all vertical lines (fixed `x`) then all horizontal
 //! lines (fixed `y`), coordinates ascending, every `step` meters — the
-//! uniform grid. The visible count is bounded: the window clamp (250·step)
-//! keeps each axis at most ~500 lines (the recorded limit is ~1000
-//! segments for any pose; [`segment_capacity_bound`] gives the
-//! pre-allocation guarantee).
+//! uniform grid. The visible count is bounded: the window clamp
+//! (5000·step) keeps each axis at most ~10 000 lines (segments ≈ 20 000
+//! for any pose; [`segment_capacity_bound`] gives the pre-allocation
+//! guarantee).
 //!
 //! Generation lives in f32 world coordinates, so it is meaningful only
 //! where f32 can still tell grid steps apart — roughly ±1e5–1e6 m from the
@@ -100,11 +102,17 @@ const DEFAULT_PX_PER_M: f32 = 2.0;
 const MIN_GRID_SCREEN_SPACING_PX: f32 = 2.0;
 
 /// Generation-window clamp in units of the current step (the no-alpha
-/// fade cutoff, see module docs): the farthest line is at most 250 steps
-/// away from the camera footprint, so a horizon-grazing view cannot grow
-/// an unbounded line set and the visible plain ends where a GPU fade
-/// would have zeroed it.
-const MAX_RADIUS_PER_STEP: f32 = 250.0;
+/// fade cutoff, see module docs): the farthest line is at most
+/// `MAX_RADIUS_PER_STEP` steps away from the camera footprint. This is
+/// the CPU substitute for the GPU distance-fade of Blender-style floor
+/// grids — the window is big enough that the grid visibly covers the
+/// viewport floor (and the origin axis rows with it), while beyond it
+/// the per-line spacing drops below ~1 px and the dense lines fuse into
+/// a uniform gray, exactly the look of a faded infinite grid. The large
+/// value (~5 km at the default 1 m step) keeps the axis rows from
+/// popping out of existence on pan/zoom — they live and die only with
+/// the grid they belong to (owner feedback 2026-09-05).
+const MAX_RADIUS_PER_STEP: f32 = 5000.0;
 
 /// Safety valve on the step ladder (radius so huge that the ladder would
 /// otherwise run forever); real windows never get near it.
@@ -512,10 +520,10 @@ mod tests {
     #[test]
     fn half_extent_is_the_grid_regenerated_extent() {
         assert_eq!(GridOptions::new(1.0, 100.0, 2.0).half_extent(), 100.0);
-        // A horizon-grazing window is clamped to 250·step (the fade bound
+        // A horizon-grazing window is clamped to 5000·step (the fade bound
         // the strips and the app overlays share).
-        assert_eq!(GridOptions::new(1.0, 4.0e7, 2.0).half_extent(), 250.0);
-        assert_eq!(GridOptions::new(1.0, 4.0e7, 0.09).half_extent(), 12_500.0);
+        assert_eq!(GridOptions::new(1.0, 4.0e7, 2.0).half_extent(), 5000.0);
+        assert_eq!(GridOptions::new(1.0, 4.0e7, 0.09).half_extent(), 250_000.0);
     }
 
     #[test]
@@ -581,15 +589,16 @@ mod tests {
         // grazing pitch) still yields exactly ±250 m of 1 m lines.
         let strips = grid_strips(&view_px(0.0, 0.0, 4.0e7, 2.0));
         let xs = vertical_x_coords(&strips);
-        let expected: Vec<f32> = (-250..=250).map(|k| k as f32).collect();
+        let expected: Vec<f32> = (-5000..=5000).map(|k| k as f32).collect();
         assert_eq!(xs, expected);
-        assert_eq!(strips.len(), 2 * 501);
-        // A coarse step clamps the window at the same bound (250·50 m).
+        assert_eq!(strips.len(), 2 * 10_001);
+        // A coarse step: the window is the visible radius (here smaller
+        // than the 5000·50 m bound), so the row spans the full ±radius.
         let strips = grid_strips(&view_px(0.0, 0.0, 1.0e5, 0.09));
         let xs = vertical_x_coords(&strips);
-        assert_eq!(xs.len(), 2 * (12_500.0 / 50.0) as usize + 1);
-        assert_eq!(*xs.first().unwrap(), -12_500.0);
-        assert_eq!(*xs.last().unwrap(), 12_500.0);
+        assert_eq!(xs.len(), 2 * (1.0e5f32 / 50.0).floor() as usize + 1);
+        assert_eq!(*xs.first().unwrap(), -100_000.0);
+        assert_eq!(*xs.last().unwrap(), 100_000.0);
     }
 
     #[test]
@@ -645,7 +654,7 @@ mod tests {
             (100.0, 2.0, 1.0, 201),
             (600.0, 0.51, 5.0, 241),
             (1300.0, 0.2, 10.0, 261),
-            (1.0e5, 0.09, 50.0, 501),
+            (1.0e5, 0.09, 50.0, 4001),
         ] {
             let strips = grid_strips(&view_px(0.0, 0.0, radius, px));
             let xs = vertical_x_coords(&strips);
@@ -786,8 +795,8 @@ mod tests {
         // And that bound is a fixed small number: one prebuild covers any.
         for radius in [100.0, 260.0, 600.0, 1e4, 1e12] {
             assert!(
-                segment_capacity_bound(&opts(radius)) <= 1024,
-                "radius {radius}"
+                segment_capacity_bound(&opts(radius)) <= 20_100,
+                "radius {radius} (2·(2·5000+5)+8)",
             );
         }
     }
