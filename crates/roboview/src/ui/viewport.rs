@@ -308,14 +308,12 @@ pub struct ViewportState {
     /// Created on the render thread (prepare); creation and refresh never
     /// route through the upload ledger (A6-safe).
     grid_mesh: Option<render::LineMesh>,
-    /// The axis reference lines through the origin (004 revision 2026-09-05:
-    /// Blender-style) — ONE long segment each for X (red) and Y (green),
-    /// crossing the whole ground as in Blender's axis lines; no Z line,
-    /// no short origin trio, no letter labels (owner rulings 2026-09-05).
-    /// Clipped to the visible ground window like the grid, refreshed with
-    /// it, painted under the `axes_on` switch. Dropped on a renderer
-    /// rebuild — its bind groups reference the old renderer's layout and
-    /// prepare re-provisions lazily.
+    /// The grid's origin axis-color rows (004 revision 2026-09-05):
+    /// the fixed y=0 grid row recolored red (X) and the fixed x=0 grid
+    /// column recolored green (Y), painted with the grid — no standalone
+    /// axis entities, no Z line, no short origin trio or letters (owner
+    /// rulings). Grid-bound like the mesh itself and refreshed with it;
+    /// dropped on a renderer rebuild and re-provisioned lazily.
     axis_lines: Option<[render::LineMesh; 2]>,
     /// View-projection of the last grid refresh — the refresh key. A
     /// bitwise-equal `view_proj` means the identical window and strips, so
@@ -1132,6 +1130,11 @@ impl ViewportState {
     /// [`ViewportState::toggle_grid`].
     pub fn toggle_axes(&mut self) {
         self.axes_on = !self.axes_on;
+        // The axis color lines are grid-bound (owner ruling 2026-09-05:
+        // no standalone axis entities): flip the refresh key so the next
+        // prepare grounds or clears them with the grid.
+        self.grid_refresh_key = None;
+        self.axis_lines = None;
     }
 
     /// Pointer → world intersection of the frame being built (status bar
@@ -1722,11 +1725,11 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         {
             line_pipeline.paint(render_pass, grid);
         }
-        // The through-origin axis reference lines (Blender-style, 004
-        // revision 2026-09-05): X red / Y green crossing the whole
-        // ground — the only origin-axes geometry after the owner ruling
-        // that removed the short origin trio and letter labels.
-        if state.axes_on
+        // The grid's origin axis-color rows (004 revision 2026-09-05):
+        // X red / Y green on the grid lines themselves — bound to the
+        // grid's own window, so they only paint with the grid.
+        if state.grid_on
+            && state.axes_on
             && let Some(lines) = state.axis_lines.as_ref()
         {
             for line in lines {
