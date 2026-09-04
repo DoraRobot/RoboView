@@ -110,6 +110,28 @@ const MAX_RADIUS_PER_STEP: f32 = 250.0;
 /// otherwise run forever); real windows never get near it.
 const LADDER_GUARD: usize = 1024;
 
+/// The origin rows of a uniform grid's strip set (004 revision
+/// 2026-09-05): the unique horizontal strip at y=0 (the world X axis row,
+/// red in the viewport) and the unique vertical strip at x=0 (the Y axis
+/// column, green). `None` when the strips contain no such row — exactly
+/// the cases where the grid window does not cover the origin rows.
+///
+/// The caller must treat the result as *part of the strips*: it contains
+/// segments verbatim from `strips`, so the colored rows can never diverge
+/// from the grid's extent, ladder step or lifetime (the owner ruling:
+/// "this line is a grid line, just colored").
+pub fn origin_rows(strips: &[[Vec3; 2]]) -> [Option<[Vec3; 2]>; 2] {
+    let x_row = strips
+        .iter()
+        .find(|s| s[0].y == 0.0 && s[1].y == 0.0)
+        .copied();
+    let y_col = strips
+        .iter()
+        .find(|s| s[0].x == 0.0 && s[1].x == 0.0)
+        .copied();
+    [x_row, y_col]
+}
+
 /// Options of a [`GridView`]: the uniform grid step and the visible
 /// window half-extent. Invalid configurations (see [`grid_strips`]) yield an
 /// empty grid instead of panicking.
@@ -494,6 +516,50 @@ mod tests {
         // the strips and the app overlays share).
         assert_eq!(GridOptions::new(1.0, 4.0e7, 2.0).half_extent(), 250.0);
         assert_eq!(GridOptions::new(1.0, 4.0e7, 0.09).half_extent(), 12_500.0);
+    }
+
+    #[test]
+    fn origin_rows_are_verbatim_parts_of_the_strips() {
+        // Default window: the X row is the exact y=0 strip and the Y
+        // column the exact x=0 strip of the generated grid — same
+        // endpoint bits, so a colored overlay cannot diverge.
+        let strips = grid_strips(&GridView::default());
+        let [x_row, y_col] = origin_rows(&strips);
+        assert!(x_row.is_some() && y_col.is_some());
+        let x_row = x_row.unwrap();
+        let y_col = y_col.unwrap();
+        assert_eq!(x_row, [Vec3::new(-100.0, 0.0, 0.0), Vec3::new(100.0, 0.0, 0.0)]);
+        assert_eq!(y_col, [Vec3::new(0.0, -100.0, 0.0), Vec3::new(0.0, 100.0, 0.0)]);
+        // The found segments must be members of the strips set (bitwise).
+        assert!(strips.iter().any(|s| *s == x_row && s[0].y == 0.0));
+        assert!(strips.iter().any(|s| *s == y_col && s[0].x == 0.0));
+    }
+
+    #[test]
+    fn origin_rows_follow_the_zoom_ladder_and_the_window() {
+        // Coarse ladder (whole-grid 5 m step): the X row is still the
+        // exact y=0 strip, spanning the grid's clipped window ±1250 m,
+        // and multiple of the step.
+        let strips = grid_strips(&view_px(0.0, 0.0, 600.0, 0.51));
+        let [x_row, y_col] = origin_rows(&strips);
+        assert!(x_row.is_some() && y_col.is_some());
+        assert_eq!(x_row.unwrap()[0], Vec3::new(-600.0, 0.0, 0.0));
+        assert_eq!(x_row.unwrap()[1], Vec3::new(600.0, 0.0, 0.0));
+        assert_eq!(y_col.unwrap()[0], Vec3::new(0.0, -600.0, 0.0));
+        assert_eq!(y_col.unwrap()[1], Vec3::new(0.0, 600.0, 0.0));
+        // A window covering neither axis has no origin row at all: None,
+        // no synthetic segment.
+        let far = grid_strips(&view(2.0e6, 3.0e5, 100.0));
+        let [x_row, y_col] = origin_rows(&far);
+        assert!(x_row.is_none(), "no y=0 row in an off-axis window");
+        assert!(y_col.is_none(), "no x=0 column in an off-axis window");
+        // A window covering exactly one axis row keeps exactly that row:
+        // the y=0 grid line still exists at x≈2e6 (a distance grid line is
+        // still a grid line — colored, never synthetic).
+        let off_x = grid_strips(&view(2.0e6, 0.0, 100.0));
+        let [x_row, y_col] = origin_rows(&off_x);
+        assert!(x_row.is_some(), "y=0 row exists wherever the grid crosses y=0");
+        assert!(y_col.is_none(), "no x=0 column unless the window covers x=0");
     }
 
     #[test]

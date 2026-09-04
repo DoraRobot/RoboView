@@ -42,6 +42,7 @@
 
 ## 完成记录
 
+- 运行修正（轴线悬浮终修，2026-09-05）：`origin_rows` 从 grid strips 直接提取（y=0 行=X 红、x=0 列=Y 绿），viewport 只做着色——不含独立几何；网格覆盖到哪线就到哪（含"网格窗覆盖 one axis row 时仍只染那一行"的钉死 UT）。此前两个版本（独立窗计算）均已回退。
 - 实现谱系：W1 `7b3548b`（pick.rs 拾取核心 55 UT + camera_math 光标锚定偏移 + line 常量共享）/ W2–W5 `f2a24d8`（键位表 + 光标锚定光标缩放 cursor_zoom + 点选/框选 + 选择集 + 修饰键/键盘协议 + 面板联动 + texts 键）。
 - 运行修正（Magic Mouse 滑动语义反馈，2026-09-04）：Blender 式 **Magic Mouse Emulation** —— `Point` 单元（触控表面/魔法鼠标）滑动=轨道、Shift+滑动=平移、Cmd+滑动=缩放（光标锚定）；真滚轮（Line/Page）保持光标锚定缩放；中键/Alt 模拟三键全部保留。`apply_scroll_camera` 纯函数 + 3 UT。
 - 运行修正（无中键鼠标反馈，2026-09-04）：Blender 式**模拟三键** —— Alt+左键=中键、Shift+Alt+左键=Shift+中键；Alt 按下时点选/框选不触发（spec A11 追加两行）。

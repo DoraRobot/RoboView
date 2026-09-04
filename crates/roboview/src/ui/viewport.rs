@@ -1211,29 +1211,23 @@ impl ViewportState {
         let window = grid_window(&view_proj, self.viewport_size());
         if self.grid_on {
             let Some(window) = window else {
-                // The grid stays off-view; the axis lines refresh with the
-                // same key below regardless (their own motion depends on
-                // the same window).
-                self.refresh_axis_lines(line_pipeline, None);
                 return;
             };
             self.refresh_grid_mesh(line_pipeline, window);
-            self.refresh_axis_lines(line_pipeline, Some(window));
-        } else {
-            self.refresh_axis_lines(line_pipeline, window);
         }
     }
 
-    /// Refresh the through-origin axis reference lines (004 revision
-    /// 2026-09-05, Blender-style): one segment per axis spanning the
-    /// visible ground window, so X (red) and Y (green) cross the whole
-    /// ground like Blender's axis lines; Z (blue) uses the same extent.
-    /// Runs under the grid refresh key (any camera move), lazily on the
-    /// first axes-on frame.
+    /// Recolor the grid's OWN origin rows (004 revision 2026-09-05): the
+    /// fixed-y=0 horizontal strip of the grid becomes the X axis row (red)
+    /// and the fixed-x=0 vertical strip the Y axis column (green). Both
+    /// are picked OUT OF the freshly generated grid strips — the exact
+    /// same geometry, so they are exactly as long as the grid, share its
+    /// window, its ladder step and its life (owner ruling: "this line IS
+    /// a grid line, just colored").
     fn refresh_axis_lines(
         &mut self,
         line_pipeline: &mut render::line::LinePipeline,
-        window: Option<GridWindow>,
+        strips: &[[Vec3; 2]],
     ) {
         let (axis_x, axis_y, _) = theme::ORIGIN_AXIS;
         let colors = [axis_x, axis_y];
@@ -1243,21 +1237,19 @@ impl ViewportState {
                 line_pipeline.with_capacity(1),
             ]);
         }
-        let Some(window) = window else {
-            // Off-view ground: the old lines stay (they are off-view too).
-            return;
-        };
-        let r = window.radius;
-        let segs = [
-            Vec3::new(-r, 0.0, 0.0)..Vec3::new(r, 0.0, 0.0),
-            Vec3::new(0.0, -r, 0.0)..Vec3::new(0.0, r, 0.0),
-        ];
+        // Strips come vertical (fixed x) first, then horizontal (fixed y);
+        // the origin rows are the unique y=0 horizontal (X) and the unique
+        // x=0 vertical (Y) entries — present exactly when the grid window
+        // covers them, absent exactly when the grid has no origin row.
+        let segments = render::grid::origin_rows(strips);
         for (i, color) in colors.iter().enumerate() {
             let Some(mesh) = self.axis_lines.as_mut().map(|m| &mut m[i]) else {
                 return;
             };
-            let seg = [segs[i].start, segs[i].end];
-            line_pipeline.update_mesh(mesh, &[seg], *color);
+            match segments[i] {
+                Some(seg) => line_pipeline.update_mesh(mesh, &[seg], *color),
+                None => line_pipeline.update_mesh(mesh, &[], *color),
+            }
         }
     }
 
@@ -1291,6 +1283,9 @@ impl ViewportState {
             .as_mut()
             .expect("grid mesh provisioned above");
         line_pipeline.update_mesh(mesh, &strips, theme::GRID_LINE);
+        // The origin rows are colored bits of THESE strips (no separate
+        // geometry, no separate window: same extent, same steps).
+        self.refresh_axis_lines(line_pipeline, &strips);
     }
 
     /// Size (points) of the current frame's viewport rect — the grid
