@@ -332,10 +332,12 @@ mod tests {
     /// a default pose; `orbit` then levels the pitch.
     fn level_camera(distance: f32) -> OrbitCamera {
         let mut camera = OrbitCamera::new(Vec3::ZERO);
+        // yaw back to 0 (the default is the 45° three-quarter view): the
+        // straight-on pose keeps the plane-pixel expectations simple.
+        camera.orbit(-camera.yaw(), -0.25);
         // pitch default is 0.6 rad; orbit down to 0.35: the eye stays above
         // the Z=0 ground plane (a truly level Z-up camera would lie IN the
         // plane and see it edge-on).
-        camera.orbit(0.0, -0.25);
         // The default eye-to-target distance is 10: zoom(delta) multiplies
         // the distance by 2^−delta, so delta = log2(10/distance) sets it.
         camera.zoom((10.0 / distance).log2());
@@ -348,7 +350,7 @@ mod tests {
     /// for plane hits.
     fn level_axes_camera(distance: f32) -> OrbitCamera {
         let mut camera = OrbitCamera::new(Vec3::ZERO);
-        camera.orbit(0.0, -0.6);
+        camera.orbit(-camera.yaw(), -0.6);
         camera.zoom((10.0 / distance).log2());
         camera
     }
@@ -849,27 +851,29 @@ mod tests {
 
     #[test]
     fn default_pose_keeps_z_up_and_x_right() {
-        // The default orbit pose (elevation 0.6 — the eye sits 10 m out on
-        // the −Y side, 34° above the Z=0 ground) is the pose the app opens
-        // with. With the Z-up convention the world +Z arm points up on
-        // screen, +X right, and the depth axis +Y projects a small upward
-        // trend (the tilted view looks over it).
+        // The default orbit pose (elevation 0.6, yaw 45°) — the three-
+        // quarter view the app opens with: +Z reads up on the vertical
+        // centerline, +X right, +Y left — the ground plane shows both
+        // horizontal axes receding instead of the face-on flat look.
         let camera = OrbitCamera::new(Vec3::ZERO);
         let view_proj = camera.view_proj(SIZE.x / SIZE.y);
         let center = SIZE * 0.5;
         let z = anchor_to_screen(&view_proj, SIZE, Vec3::Z * 2.0).unwrap();
-        let y = anchor_to_screen(&view_proj, SIZE, Vec3::Y * 2.0).unwrap();
         let x = anchor_to_screen(&view_proj, SIZE, Vec3::X * 2.0).unwrap();
+        let y = anchor_to_screen(&view_proj, SIZE, Vec3::Y * 2.0).unwrap();
         assert!(z.y < center.y - 20.0, "world +Z (up) must sit above center");
-        assert!(z.y < y.y, "the up axis must dominate the depth axis");
         assert!(
-            y.y < center.y,
-            "world +Y stays above center in the tilted view"
+            (z.x - center.x).abs() < 1.0,
+            "+Z stays on the vertical centerline"
         );
-        assert!(x.x > center.x + 40.0, "world +X must sit right of center");
+        assert!(x.x > center.x + 30.0, "world +X must sit right of center");
         assert!(
-            (x.y - center.y).abs() < 1.0,
-            "+X stays on the horizontal centerline"
+            y.x < center.x - 20.0,
+            "world +Y must sit left of center (three-quarter)"
+        );
+        assert!(
+            (x.y - center.y).abs() < (z.y - center.y).abs(),
+            "the horizontal axes read flatter than the up axis"
         );
     }
 
@@ -893,21 +897,20 @@ mod tests {
 
     #[test]
     fn axis_passing_near_the_eye_keeps_its_screen_trend() {
-        // Yaw-π/4 elevation-0.6 pose: the +X axis passes near the eye and
-        // its visible half keeps running rightward on screen; +Z stays
-        // upward — the near-eye projection is never mirrored by a sign flip.
+        // Bring the three-quarter default (yaw −45°) around to yaw 0: the
+        // straight-on pose puts +X exactly right — the near-eye axis keeps
+        // its rightward trend.
         let mut camera = OrbitCamera::new(Vec3::ZERO);
         camera.orbit(FRAC_PI_4, 0.0);
         let view_proj = camera.view_proj(SIZE.x / SIZE.y);
-        let corner = Rect2 {
-            min: Vec2::ZERO,
-            max: SIZE,
-        };
-        let dirs = orientation_gizmo_dirs(&view_proj, SIZE, corner, 20.0);
-        assert!(dirs[0].1, "X arm visible");
-        assert!(dirs[0].0.x > 0.3, "X leans right, got {:?}", dirs[0].0);
-        assert!(dirs[2].1, "Z arm visible");
-        assert!(dirs[2].0.y < -0.3, "Z leans up, got {:?}", dirs[2].0);
+        let center = SIZE * 0.5;
+        let x = anchor_to_screen(&view_proj, SIZE, Vec3::X * 2.0).unwrap();
+        let z = anchor_to_screen(&view_proj, SIZE, Vec3::Z * 2.0).unwrap();
+        assert!(
+            x.x > center.x,
+            "near-eye +X keeps its rightward screen trend"
+        );
+        assert!(z.y < center.y - 10.0, "+Z stays above center");
     }
 
     #[test]

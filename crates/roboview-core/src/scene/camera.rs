@@ -28,11 +28,18 @@
 //! raises the eye above the Z=0 ground plane. The projection maps depth to
 //! the wgpu/WebGPU NDC range `z ∈ [0, 1]` (near plane = 0, far plane = 1).
 
-use std::f32::consts::{FRAC_PI_2, FRAC_PI_3};
+use std::f32::consts::{FRAC_PI_2, FRAC_PI_3, FRAC_PI_4};
 
 use glam::{Mat4, Vec2, Vec3};
 
 use crate::io::Aabb;
+
+/// Default azimuth around the world +Z axis, in radians (−π/4): the
+/// three-quarter view every mature 3D tool opens with — the eye sits on the
+/// −X/−Y quadrant, screen axes read X right / Y left / Z up and the ground
+/// plane shows both in-plane axes receding, instead of the face-on flat
+/// look of a yaw-0 front view.
+const DEFAULT_YAW: f32 = -FRAC_PI_4;
 
 /// Default elevation of the eye above the target, in radians (~34°): high
 /// enough to read the third dimension of a point cloud at first glance.
@@ -99,12 +106,13 @@ pub struct OrbitCamera {
 }
 
 impl OrbitCamera {
-    /// A camera with the default pose (yaw 0, pitch `DEFAULT_PITCH`,
-    /// distance `DEFAULT_DISTANCE`) aimed at `target`.
+    /// A camera with the default pose (yaw `DEFAULT_YAW` — the 45°
+    /// three-quarter view, pitch `DEFAULT_PITCH`, distance
+    /// `DEFAULT_DISTANCE`) aimed at `target`.
     pub fn new(target: Vec3) -> Self {
         Self {
             target,
-            yaw: 0.0,
+            yaw: DEFAULT_YAW,
             pitch: DEFAULT_PITCH,
             distance: DEFAULT_DISTANCE,
             framed_extent: 0.0,
@@ -145,7 +153,7 @@ impl OrbitCamera {
         let distance = (1.5 * extent + FRAMING_MARGIN).clamp(MIN_DISTANCE, MAX_DISTANCE);
         Self {
             target: center,
-            yaw: 0.0,
+            yaw: DEFAULT_YAW,
             pitch: DEFAULT_PITCH,
             distance,
             framed_extent: extent,
@@ -343,7 +351,7 @@ mod tests {
         let target = Vec3::new(1.0, -2.0, 3.0);
         let cam = OrbitCamera::new(target);
         assert_eq!(cam.target(), target);
-        assert_eq!(cam.yaw(), 0.0);
+        assert_eq!(cam.yaw(), DEFAULT_YAW);
         assert_eq!(cam.pitch(), DEFAULT_PITCH);
         assert_eq!(cam.distance(), DEFAULT_DISTANCE);
         assert!(cam.view_proj(1.0).is_finite());
@@ -418,7 +426,7 @@ mod tests {
     #[test]
     fn pan_moves_the_target_in_the_screen_plane_scaled_by_distance() {
         let mut cam = OrbitCamera::new(Vec3::ZERO);
-        cam.orbit(0.0, -DEFAULT_PITCH); // level view (pitch 0): right = +X, up = +Z
+        cam.orbit(-cam.yaw(), -DEFAULT_PITCH); // yaw back to 0, then level: right = +X, up = +Z
         let distance = cam.distance();
         cam.pan(Vec2::new(0.25, -0.5));
         assert!(
