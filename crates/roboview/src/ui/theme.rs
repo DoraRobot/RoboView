@@ -67,13 +67,15 @@ pub const SELECT_HIGHLIGHT: Color = srgb(255, 128, 0);
 /// Ground-grid line color of the viewport helper layer (004 spec §6 地面
 /// 网格/网格线; A9 assertion token).
 ///
-/// A neutral gray, darker than every semantic color of the palette — the
-/// grid must recede behind the origin axes and the selection highlight
-/// (A9 asserts the ordering). `(70, 70, 70)` has a relative luminance of
-/// ≈ 0.061 in linear light, below even the darkest semantic color, the
-/// pure-blue Z axis (≈ 0.072), while staying clearly readable on the dark
-/// viewport floor.
-pub const GRID_LINE: Color = srgb(70, 70, 70);
+/// A neutral gray, darker than the semantic colors that float above it —
+/// the origin axis rows (red/green) and the selection highlight (A9
+/// asserts the ordering); the Z blue is no longer painted (origin trio
+/// removed), so it no longer constrains the gray. `(110, 110, 110)` reads
+/// as a proper grid from the default pose yet still recedes behind the
+/// saturated colors; `(70, 70, 70)` from the original calibration
+/// vanished under video capture and dense low-angle line fusion — the
+/// recorded "ghost" feedback (2026-09-05).
+pub const GRID_LINE: Color = srgb(110, 110, 110);
 
 /// World-origin axis trio of the viewport helper layer (004 spec §6 世界
 /// 原点三轴; A9 assertion token): the X / Y / Z axes of the world origin,
@@ -208,14 +210,16 @@ mod tests {
     fn grid_line_is_a_neutral_gray_darker_than_every_semantic_color() {
         // A9 (004 spec §4): the grid token is a neutral gray (equal RGB
         // channels) and darker than every semantic color it must never
-        // compete with — the selection orange and the three axis colors.
-        // The binding constraint is the pure-blue Z axis at a relative
-        // luminance of ≈ 0.072; gray 70 (≈ 0.061) stays below it while
-        // remaining readable on the dark floor.
+        // compete with — the selection orange and the still-painted axis
+        // colors (X red, Y green; the Z blue is no longer drawn since the
+        // origin trio was removed, so it does not constrain the gray).
         assert_eq!(GRID_LINE.r, GRID_LINE.g, "grid token must be neutral gray");
         assert_eq!(GRID_LINE.g, GRID_LINE.b, "grid token must be neutral gray");
         let grid_luminance = relative_luminance(GRID_LINE);
-        for semantic in [SELECT_HIGHLIGHT].into_iter().chain(axis_colors()) {
+        for semantic in [SELECT_HIGHLIGHT]
+            .into_iter()
+            .chain(axis_colors().into_iter().take(2))
+        {
             let luminance = relative_luminance(semantic);
             assert!(
                 grid_luminance < luminance,

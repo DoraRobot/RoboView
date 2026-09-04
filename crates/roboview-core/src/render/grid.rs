@@ -528,8 +528,14 @@ mod tests {
         assert!(x_row.is_some() && y_col.is_some());
         let x_row = x_row.unwrap();
         let y_col = y_col.unwrap();
-        assert_eq!(x_row, [Vec3::new(-100.0, 0.0, 0.0), Vec3::new(100.0, 0.0, 0.0)]);
-        assert_eq!(y_col, [Vec3::new(0.0, -100.0, 0.0), Vec3::new(0.0, 100.0, 0.0)]);
+        assert_eq!(
+            x_row,
+            [Vec3::new(-100.0, 0.0, 0.0), Vec3::new(100.0, 0.0, 0.0)]
+        );
+        assert_eq!(
+            y_col,
+            [Vec3::new(0.0, -100.0, 0.0), Vec3::new(0.0, 100.0, 0.0)]
+        );
         // The found segments must be members of the strips set (bitwise).
         assert!(strips.iter().any(|s| *s == x_row && s[0].y == 0.0));
         assert!(strips.iter().any(|s| *s == y_col && s[0].x == 0.0));
@@ -558,8 +564,14 @@ mod tests {
         // still a grid line — colored, never synthetic).
         let off_x = grid_strips(&view(2.0e6, 0.0, 100.0));
         let [x_row, y_col] = origin_rows(&off_x);
-        assert!(x_row.is_some(), "y=0 row exists wherever the grid crosses y=0");
-        assert!(y_col.is_none(), "no x=0 column unless the window covers x=0");
+        assert!(
+            x_row.is_some(),
+            "y=0 row exists wherever the grid crosses y=0"
+        );
+        assert!(
+            y_col.is_none(),
+            "no x=0 column unless the window covers x=0"
+        );
     }
 
     #[test]
