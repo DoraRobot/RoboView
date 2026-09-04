@@ -1744,69 +1744,76 @@ pub fn show_viewport(
                 rect,
                 &mut viewport.scene.camera,
             );
-            // 005 A9/A11: left click = pick (egui's click means the press
-            // never crossed the drag threshold — below 4 px, so the same
-            // button's drag stays box-select); a hit highlights at once
-            // through the appearance channel and the app mirrors it.
-            if response.clicked() {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let cursor = Vec2::new(pos.x - rect.min.x, pos.y - rect.min.y);
-                    let (add, subtract) = ui.ctx().input(|i| (i.modifiers.shift, i.modifiers.ctrl));
-                    let clicked = {
-                        let mut viewport = lock_state(state);
-                        let clicked = viewport.pick_at(cursor).map(|hit| hit.id);
-                        let ids = viewport.mix_selection(
-                            &clicked.into_iter().collect::<Vec<_>>(),
-                            add,
-                            subtract,
-                        );
-                        viewport.set_selection(&ids);
-                        ids
-                    };
-                    lock_state(state).report_click_selection(clicked);
-                }
-            }
-            // 005 A9: primary drag = box-select behind the pointer
-            // threshold; the camera is frozen for its duration (the drag
-            // never reaches camera_input) and the rubber band is painted
-            // by the overlay pass.
-            if response.drag_started_by(egui::PointerButton::Primary) {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    lock_state(state).box_drag_start =
-                        Some(Vec2::new(pos.x - rect.min.x, pos.y - rect.min.y));
-                }
-            }
-            if response.drag_stopped_by(egui::PointerButton::Primary) {
-                let (start, ids) = {
-                    let mut viewport = lock_state(state);
-                    let start = viewport.box_drag_start.take();
-                    let ids = start
-                        .map(|s| {
-                            let now = Vec2::new(rect.max.x - rect.min.x, rect.max.y - rect.min.y);
-                            // The stopped pointer position is the last
-                            // interact position of this drag.
-                            let end = response
-                                .interact_pointer_pos()
-                                .map(|p| Vec2::new(p.x - rect.min.x, p.y - rect.min.y))
-                                .unwrap_or(now);
-                            let hits = viewport.box_pick(s, end);
-                            let (add, subtract) =
-                                ui.ctx().input(|i| (i.modifiers.shift, i.modifiers.ctrl));
-                            viewport.mix_selection(&hits, add, subtract)
-                        })
-                        .unwrap_or_default();
-                    (start, ids)
-                };
-                if start.is_some() {
-                    lock_state(state).set_selection(&ids);
-                    lock_state(state).report_click_selection(ids);
-                    lock_state(state).box_drag_start = None;
-                    ui.ctx().request_repaint();
-                }
-            }
         }
         (scene_empty, has_content)
     };
+
+    // The picking gestures run AFTER the lock block above: they take
+    // their own short locks and a nested lock_state here would deadlock
+    // the frame (the viewport mutex is not reentrant — the same trap as
+    // the 004 install path and the 005 panel reads).
+    if has_content {
+        // 005 A9/A11: left click = pick (egui's click means the press
+        // never crossed the drag threshold — below 4 px, so the same
+        // button's drag stays box-select); a hit highlights at once
+        // through the appearance channel and the app mirrors it.
+        if response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let cursor = Vec2::new(pos.x - rect.min.x, pos.y - rect.min.y);
+                let (add, subtract) = ui.ctx().input(|i| (i.modifiers.shift, i.modifiers.ctrl));
+                let clicked = {
+                    let mut viewport = lock_state(state);
+                    let clicked = viewport.pick_at(cursor).map(|hit| hit.id);
+                    let ids = viewport.mix_selection(
+                        &clicked.into_iter().collect::<Vec<_>>(),
+                        add,
+                        subtract,
+                    );
+                    viewport.set_selection(&ids);
+                    ids
+                };
+                lock_state(state).report_click_selection(clicked);
+            }
+        }
+        // 005 A9: primary drag = box-select behind the pointer
+        // threshold; the camera is frozen for its duration (the drag
+        // never reaches camera_input) and the rubber band is painted
+        // by the overlay pass.
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            if let Some(pos) = response.interact_pointer_pos() {
+                lock_state(state).box_drag_start =
+                    Some(Vec2::new(pos.x - rect.min.x, pos.y - rect.min.y));
+            }
+        }
+        if response.drag_stopped_by(egui::PointerButton::Primary) {
+            let (start, ids) = {
+                let mut viewport = lock_state(state);
+                let start = viewport.box_drag_start.take();
+                let ids = start
+                    .map(|s| {
+                        let now = Vec2::new(rect.max.x - rect.min.x, rect.max.y - rect.min.y);
+                        // The stopped pointer position is the last
+                        // interact position of this drag.
+                        let end = response
+                            .interact_pointer_pos()
+                            .map(|p| Vec2::new(p.x - rect.min.x, p.y - rect.min.y))
+                            .unwrap_or(now);
+                        let hits = viewport.box_pick(s, end);
+                        let (add, subtract) =
+                            ui.ctx().input(|i| (i.modifiers.shift, i.modifiers.ctrl));
+                        viewport.mix_selection(&hits, add, subtract)
+                    })
+                    .unwrap_or_default();
+                (start, ids)
+            };
+            if start.is_some() {
+                lock_state(state).set_selection(&ids);
+                lock_state(state).report_click_selection(ids);
+                lock_state(state).box_drag_start = None;
+                ui.ctx().request_repaint();
+            }
+        }
+    }
 
     if !rect.is_finite() || rect.width() <= 0.0 || rect.height() <= 0.0 {
         return;
