@@ -12,6 +12,13 @@
 //!   the middle button (orbit), **shift+alt+primary drag** as the
 //!   shifted-middle (pan), and the picking/box-select gestures of the
 //!   viewport stay off while alt is down (005 A11 revision);
+//! - the Magic Mouse's touch surface (and trackpad scrolls), which
+//!   arrive as `MouseWheelUnit::Point` events, emulate middle-drag the
+//!   way Blender's Magic Mouse Emulation does: plain surface move =
+//!   orbit, **shift + move = pan**, **command + move = zoom**; a real
+//!   wheel (`Line`/`Page` units) keeps its classic zoom-anchored-
+//!   at-cursor behavior. Both coexist: mice with a middle button and
+//!   Magic Mouse users share the same keymap (005 A11 revision);
 //! - scroll zooms in on wheel-up / two-finger-up, out on the reverse,
 //!   **anchored at the cursor** (the world point under the pointer stays
 //!   put — [`OrbitCamera`] zoom would swing the scene around its target
@@ -121,23 +128,87 @@ pub fn apply_pointer_events(
     }
 
     if response.hovered() && !ctx.wants_pointer_input() {
-        let scroll = ctx.input(|input| input.raw_scroll_delta.y);
-        if scroll.is_finite() && scroll != 0.0 {
-            // Cursor-anchored zoom (005 A11): the world point under the
-            // pointer keeps its pixel.
-            let cursor_px = response
-                .hover_pos()
-                .map(|p| Vec2::new(p.x - viewport.min.x, p.y - viewport.min.y))
-                .unwrap_or_else(|| Vec2::ZERO);
-            let aspect = viewport.width() / viewport.height();
+        let cursor_px = response
+            .hover_pos()
+            .map(|p| Vec2::new(p.x - viewport.min.x, p.y - viewport.min.y))
+            .unwrap_or_else(|| Vec2::ZERO);
+        let viewport_map = Vec2::new(viewport.width(), viewport.height());
+        let aspect = viewport.width() / viewport.height();
+        // Walk the raw scroll events this frame: a tracked Magic Mouse /
+        // trackpad surface arrives as Point units and follows Blender's
+        // Magic-Mouse-Emulation gestures, a real wheel (Line/Page) keeps
+        // the classic cursor-anchored zoom.
+        let events = ctx.input(|input| input.events.clone());
+        for event in events {
+            if let egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+            } = event
+            {
+                let delta = Vec2::new(delta.x, delta.y);
+                apply_scroll_camera(
+                    camera,
+                    aspect,
+                    viewport_map,
+                    cursor_px,
+                    delta,
+                    unit,
+                    modifiers,
+                );
+            }
+        }
+    }
+}
+
+/// Dispatch one scroll event to the camera (005 A11 revision): tracked
+/// touches (`Point` units — Magic Mouse surface, trackpad scrolls) right.
+/// Headless-testable; the drag direction signs match the middle-drag
+/// "grab the cloud" convention for continuity:
+///
+/// - plain touch move = orbit (the middle-drag simulation);
+/// - shift + move = pan;
+/// - command + move = zoom (cursor-anchored);
+/// - real-wheel units (Line/Page) = cursor-anchored zoom, unchanged.
+fn apply_scroll_camera(
+    camera: &mut OrbitCamera,
+    aspect: f32,
+    viewport_px: Vec2,
+    cursor_px: Vec2,
+    delta: Vec2,
+    unit: egui::MouseWheelUnit,
+    modifiers: egui::Modifiers,
+) {
+    if matches!(unit, egui::MouseWheelUnit::Point) {
+        if modifiers.command {
             cursor_zoom(
                 camera,
                 aspect,
-                Vec2::new(viewport.width(), viewport.height()),
+                viewport_px,
                 cursor_px,
-                scroll * ZOOM_LOG2_PER_SCROLL_POINT,
+                delta.y * ZOOM_LOG2_PER_SCROLL_POINT,
+            );
+        } else if modifiers.shift {
+            // Treat the touch motion as a middle-drag pan: the cloud
+            // follows the fingers on the focal plane.
+            let k = focal_plane_track_factor() / viewport_px.y;
+            camera.pan(Vec2::new(-delta.x * k, delta.y * k));
+        } else {
+            // The Magic Mouse surface IS a middle click in Blender's
+            // magic-mouse emulation: plain motion orbits.
+            camera.orbit(
+                -delta.x * ORBIT_RADIANS_PER_POINT,
+                delta.y * ORBIT_RADIANS_PER_POINT,
             );
         }
+    } else if delta.y != 0.0 {
+        cursor_zoom(
+            camera,
+            aspect,
+            viewport_px,
+            cursor_px,
+            delta.y * ZOOM_LOG2_PER_SCROLL_POINT,
+        );
     }
 }
 
@@ -246,5 +317,83 @@ mod tests {
         cursor_zoom(&mut camera, 1.0, viewport, Vec2::new(400.0, 300.0), 0.0);
         // A degenerate viewport (hidden window) stays a no-op too.
         cursor_zoom(&mut camera, 1.0, Vec2::new(0.0, 0.0), Vec2::ZERO, 1.0);
+    }
+
+    #[test]
+    fn magic_mouse_surface_orbits_pans_and_zooms_per_blender() {
+        // 005 A11 revision: Point-unit motion = Blender's Magic Mouse
+        // Emulation (surface = middle-drag); Line units keep the wheel
+        // zoom. Command/Shift select the pan/zoom branch; modifiers on
+        // the wheel branch are ignored (classic scroll zoom).
+        let viewport = Vec2::new(800.0, 600.0);
+        let cursor = Vec2::new(410.0, 290.0);
+        let aspect = viewport.x / viewport.y;
+        let wheel = egui::Modifiers::default();
+
+        // Surface move, no modifier -> orbit: yaw changes, distance not.
+        let mut camera = OrbitCamera::new(Vec3::ZERO);
+        let yaw0 = camera.yaw();
+        apply_scroll_camera(
+            &mut camera,
+            aspect,
+            viewport,
+            cursor,
+            Vec2::new(30.0, 12.0),
+            egui::MouseWheelUnit::Point,
+            wheel,
+        );
+        assert!((camera.yaw() - yaw0).abs() > 1e-3, "surface move orbits");
+
+        // Surface move + shift -> pan: the target moves, yaw identical.
+        let mut camera = OrbitCamera::new(Vec3::ZERO);
+        let yaw0 = camera.yaw();
+        let target0 = camera.target();
+        apply_scroll_camera(
+            &mut camera,
+            aspect,
+            viewport,
+            cursor,
+            Vec2::new(30.0, 12.0),
+            egui::MouseWheelUnit::Point,
+            egui::Modifiers::SHIFT,
+        );
+        assert_eq!(camera.yaw(), yaw0, "shift+surface must not orbit");
+        assert!(
+            (camera.target() - target0).length() > 1e-3,
+            "shift+surface pans"
+        );
+
+        // Surface move + command -> cursor-anchored zoom.
+        let mut camera = OrbitCamera::new(Vec3::ZERO);
+        let d0 = camera.distance();
+        apply_scroll_camera(
+            &mut camera,
+            aspect,
+            viewport,
+            cursor,
+            Vec2::new(0.0, 40.0),
+            egui::MouseWheelUnit::Point,
+            egui::Modifiers::COMMAND,
+        );
+        assert!((camera.distance() - d0).abs() > 1e-2, "cmd+surface zooms");
+        // The A11 drift bound holds for that zoom too.
+        let vp = camera.view_proj(aspect);
+        let w = pointer_world(&vp, viewport, cursor, WorldPlane::CameraTargetPlane).unwrap();
+        let px = anchor_to_screen(&vp, viewport, w).unwrap();
+        assert!((px - cursor).length() <= 0.005 * viewport.y);
+
+        // Real wheel (Line unit) -> zoom, modifiers ignored.
+        let mut camera = OrbitCamera::new(Vec3::ZERO);
+        let d0 = camera.distance();
+        apply_scroll_camera(
+            &mut camera,
+            aspect,
+            viewport,
+            cursor,
+            Vec2::new(0.0, 40.0),
+            egui::MouseWheelUnit::Line,
+            wheel,
+        );
+        assert!((camera.distance() - d0).abs() > 1e-2, "wheel zooms");
     }
 }
