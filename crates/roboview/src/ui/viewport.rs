@@ -1757,7 +1757,11 @@ pub fn show_viewport(
         // never crossed the drag threshold — below 4 px, so the same
         // button's drag stays box-select); a hit highlights at once
         // through the appearance channel and the app mirrors it.
-        if response.clicked() {
+        // With alt held the primary button simulates the middle button
+        // (Blender-style, Magic Mouse users) — picking and box-select
+        // stand down for that gesture (005 A11 revision).
+        let alt_gesture = ui.ctx().input(|i| i.modifiers.alt);
+        if response.clicked() && !alt_gesture {
             if let Some(pos) = response.interact_pointer_pos() {
                 let cursor = Vec2::new(pos.x - rect.min.x, pos.y - rect.min.y);
                 let (add, subtract) = ui.ctx().input(|i| (i.modifiers.shift, i.modifiers.ctrl));
@@ -1779,13 +1783,13 @@ pub fn show_viewport(
         // threshold; the camera is frozen for its duration (the drag
         // never reaches camera_input) and the rubber band is painted
         // by the overlay pass.
-        if response.drag_started_by(egui::PointerButton::Primary) {
+        if response.drag_started_by(egui::PointerButton::Primary) && !alt_gesture {
             if let Some(pos) = response.interact_pointer_pos() {
                 lock_state(state).box_drag_start =
                     Some(Vec2::new(pos.x - rect.min.x, pos.y - rect.min.y));
             }
         }
-        if response.drag_stopped_by(egui::PointerButton::Primary) {
+        if response.drag_stopped_by(egui::PointerButton::Primary) && !alt_gesture {
             let (start, ids) = {
                 let mut viewport = lock_state(state);
                 let start = viewport.box_drag_start.take();

@@ -7,6 +7,11 @@
 //!
 //! - middle-button drag orbits the cloud around the camera target;
 //! - shift + middle drag pans the cloud in the screen plane;
+//! - a mouse with no middle button (Apple Magic Mouse etc.) follows
+//!   Blender's "simulate 3-button mouse": **alt + primary drag** acts as
+//!   the middle button (orbit), **shift+alt+primary drag** as the
+//!   shifted-middle (pan), and the picking/box-select gestures of the
+//!   viewport stay off while alt is down (005 A11 revision);
 //! - scroll zooms in on wheel-up / two-finger-up, out on the reverse,
 //!   **anchored at the cursor** (the world point under the pointer stays
 //!   put — [`OrbitCamera`] zoom would swing the scene around its target
@@ -84,8 +89,15 @@ pub fn apply_pointer_events(
     camera: &mut OrbitCamera,
 ) {
     let shift = ctx.input(|input| input.modifiers.shift);
+    let alt = ctx.input(|input| input.modifiers.alt);
 
-    if response.dragged_by(egui::PointerButton::Middle) {
+    // The camera gesture is the middle button — real, or, on a mouse
+    // without one (Apple Magic Mouse / a trackpad), the Blender-style
+    // simulation: alt + primary drag acts as middle drag.
+    let middle_or_emulated = response.dragged_by(egui::PointerButton::Middle)
+        || (alt && response.dragged_by(egui::PointerButton::Primary));
+
+    if middle_or_emulated {
         let drag = response.drag_delta();
         // Shift + middle-drag pans (005 A11); plain middle-drag orbits —
         // the pro-tools convention, so the left button is free for

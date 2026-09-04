@@ -43,5 +43,6 @@
 ## 完成记录
 
 - 实现谱系：W1 `7b3548b`（pick.rs 拾取核心 55 UT + camera_math 光标锚定偏移 + line 常量共享）/ W2–W5 `f2a24d8`（键位表 + 光标锚定光标缩放 cursor_zoom + 点选/框选 + 选择集 + 修饰键/键盘协议 + 面板联动 + texts 键）。
+- 运行修正（无中键鼠标反馈，2026-09-04）：Blender 式**模拟三键** —— Alt+左键=中键、Shift+Alt+左键=Shift+中键；Alt 按下时点选/框选不触发（spec A11 追加两行）。
 - 门禁最终态：clippy 全零（block v0.1.6 future-incompat 除外）、`cargo test --workspace` 92+243 全绿（texts warn-once 为已知并行偶发、单跑即过）、A9 守卫绿、release 冒烟 0 panic。
 - 实现偏差回填：①`PickContext.world_per_pixel_scale` 由 app 从 `vertical_fov()` 推导（fov 无法从组合矩阵反推）；②marker 文字为 overlay 类仲裁（最上层标签优先,再按 t）——与 005 描绘的标签在上层语义一致；③等距取**先加者**（最早绘制),tasks 表注释相应先行修正；④mesh 双面命中（渲染无剔除）；⑤点云桶索引锚定 Aabb.min；⑥箭头常量由 line.rs `pub(crate)` 共享（消除镜像漂移）；⑦spec §6 的 app 层索引缓存留待性能优化（当前先命中后 bucket,场景规模实测点云 ≤1e7 可接受,超规模记录）。
