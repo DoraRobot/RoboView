@@ -153,10 +153,6 @@ const GRID_RADIUS_CAP: f32 = 4.0e7;
 /// Multiplicative slack of the measured visible-ground extent, absorbing
 /// the float rounding of the frustum crossings.
 const GRID_RADIUS_MARGIN: f32 = 1.05;
-/// Fixed world length (m) of the world-origin axis trio (spec §6:
-/// "示意长度固定" — one grid cell). World-fixed geometry never needs
-/// a camera-driven refresh, unlike the windowed grid.
-const ORIGIN_AXIS_LENGTH: f32 = 3.0;
 /// Radius (points) of the orientation indicator's backdrop disc.
 const INDICATOR_RADIUS: f32 = 30.0;
 /// Distance (points) of the indicator disc center from the top-right
@@ -312,18 +308,15 @@ pub struct ViewportState {
     /// Created on the render thread (prepare); creation and refresh never
     /// route through the upload ledger (A6-safe).
     grid_mesh: Option<render::LineMesh>,
-    /// The world-origin axis trio: three one-segment meshes, X red / Y
-    /// green / Z blue (theme ORIGIN_AXIS — the 002 semantic colors), at
-    /// the fixed [`ORIGIN_AXIS_LENGTH`]. World-fixed, so once provisioned
-    /// they never refresh. Both helper mesh groups are dropped on a
-    /// renderer rebuild — their bind groups reference the old renderer's
-    /// layout — and re-provisioned by the next prepare.
-    axes_meshes: Option<[render::LineMesh; 3]>,
     /// The axis reference lines through the origin (004 revision 2026-09-05:
-    /// Blender-style axis lines) — one long segment per axis, clipped to
-    /// the visible ground window like the grid, refreshed with it. Painted
-    /// with the same 002 semantic colors, under the same `axes_on` switch.
-    axis_lines: Option<[render::LineMesh; 3]>,
+    /// Blender-style) — ONE long segment each for X (red) and Y (green),
+    /// crossing the whole ground as in Blender's axis lines; no Z line,
+    /// no short origin trio, no letter labels (owner rulings 2026-09-05).
+    /// Clipped to the visible ground window like the grid, refreshed with
+    /// it, painted under the `axes_on` switch. Dropped on a renderer
+    /// rebuild — its bind groups reference the old renderer's layout and
+    /// prepare re-provisions lazily.
+    axis_lines: Option<[render::LineMesh; 2]>,
     /// View-projection of the last grid refresh — the refresh key. A
     /// bitwise-equal `view_proj` means the identical window and strips, so
     /// nothing regenerates while the camera sits still (A11: no crawl, no
@@ -366,7 +359,6 @@ impl ViewportState {
             grid_on: std::env::var("ROBOVIEW_DEMO_GRID_OFF").is_err(),
             axes_on: true,
             grid_mesh: None,
-            axes_meshes: None,
             axis_lines: None,
             grid_refresh_key: None,
             pointer_hover: None,
@@ -472,7 +464,6 @@ impl ViewportState {
         // pipeline), so a rebuild drops them; the next prepare
         // re-provisions and refreshes them lazily.
         self.grid_mesh = None;
-        self.axes_meshes = None;
         self.axis_lines = None;
         self.grid_refresh_key = None;
         self.renderer = Some(renderer);
@@ -1192,22 +1183,6 @@ impl ViewportState {
     }
 
     fn refresh_helper_layer_with(&mut self, line_pipeline: &mut render::line::LinePipeline) {
-        // World-origin axes: three one-segment meshes at the fixed length.
-        // World-fixed geometry needs no camera refresh, so this runs once
-        // per renderer lifetime.
-        if self.axes_on && self.axes_meshes.is_none() {
-            let (axis_x, axis_y, axis_z) = theme::ORIGIN_AXIS;
-            let axes = [(Vec3::X, axis_x), (Vec3::Y, axis_y), (Vec3::Z, axis_z)];
-            let mut meshes = [
-                line_pipeline.with_capacity(1),
-                line_pipeline.with_capacity(1),
-                line_pipeline.with_capacity(1),
-            ];
-            for (mesh, (axis, color)) in meshes.iter_mut().zip(axes) {
-                line_pipeline.update_mesh(mesh, &[[Vec3::ZERO, axis * ORIGIN_AXIS_LENGTH]], color);
-            }
-            self.axes_meshes = Some(meshes);
-        }
         if !self.grid_on && !self.axes_on {
             return;
         }
@@ -1257,11 +1232,10 @@ impl ViewportState {
         line_pipeline: &mut render::line::LinePipeline,
         window: Option<GridWindow>,
     ) {
-        let (axis_x, axis_y, axis_z) = theme::ORIGIN_AXIS;
-        let axes = [(Vec3::X, axis_x), (Vec3::Y, axis_y), (Vec3::Z, axis_z)];
+        let (axis_x, axis_y, _) = theme::ORIGIN_AXIS;
+        let colors = [axis_x, axis_y];
         if self.axis_lines.is_none() {
             self.axis_lines = Some([
-                line_pipeline.with_capacity(1),
                 line_pipeline.with_capacity(1),
                 line_pipeline.with_capacity(1),
             ]);
@@ -1274,9 +1248,8 @@ impl ViewportState {
         let segs = [
             Vec3::new(-r, 0.0, 0.0)..Vec3::new(r, 0.0, 0.0),
             Vec3::new(0.0, -r, 0.0)..Vec3::new(0.0, r, 0.0),
-            Vec3::new(0.0, 0.0, -r)..Vec3::new(0.0, 0.0, r),
         ];
-        for (i, (_, color)) in axes.iter().enumerate() {
+        for (i, color) in colors.iter().enumerate() {
             let Some(mesh) = self.axis_lines.as_mut().map(|m| &mut m[i]) else {
                 return;
             };
@@ -1749,17 +1722,10 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         {
             line_pipeline.paint(render_pass, grid);
         }
-        if state.axes_on
-            && let Some(axes) = state.axes_meshes.as_ref()
-        {
-            for axis in axes {
-                line_pipeline.paint(render_pass, axis);
-            }
-        }
         // The through-origin axis reference lines (Blender-style, 004
-        // revision 2026-09-05) paint right after the origin short axes,
-        // same semantic colors, same switch — long X/Y lines crossing the
-        // whole ground beside the short labels.
+        // revision 2026-09-05): X red / Y green crossing the whole
+        // ground — the only origin-axes geometry after the owner ruling
+        // that removed the short origin trio and letter labels.
         if state.axes_on
             && let Some(lines) = state.axis_lines.as_ref()
         {
@@ -1926,7 +1892,6 @@ pub fn show_viewport(
         // origin axis letters, and the corner orientation indicator,
         // painted after the 3D callback so they always sit on top (spec §6).
         paint_labels(&painter, rect, state);
-        paint_origin_axis_labels(&painter, rect, state);
         paint_indicator(&painter, rect, state);
 
         // 005 A9: the box-select rubber band, painted after the 3D
@@ -2207,57 +2172,6 @@ fn paint_label(
 /// non-finite origins or non-positive lengths draw no geometry and get no
 /// letters either.
 ///
-/// Overlay letters of the world-origin axis trio (X red / Y green / Z
-/// blue, the 002 semantic colors at the fixed `ORIGIN_AXIS_LENGTH`),
-/// projected per frame like the frame labels — so the default view reads
-/// its three axes at a glance.
-fn paint_origin_axis_labels(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    state: &Arc<Mutex<ViewportState>>,
-) {
-    let lock = lock_state(state);
-    if !lock.axes_on() {
-        return;
-    }
-    let (view_proj, view_rect) = (
-        lock.scene
-            .camera
-            .view_proj(rect.width() / rect.height().max(1.0)),
-        rect,
-    );
-    drop(lock);
-    let tips = [
-        (
-            Vec3::X * ORIGIN_AXIS_LENGTH,
-            texts::AXIS_X,
-            theme::to_color32(theme::ORIGIN_AXIS.0),
-        ),
-        (
-            Vec3::Y * ORIGIN_AXIS_LENGTH,
-            texts::AXIS_Y,
-            theme::to_color32(theme::ORIGIN_AXIS.1),
-        ),
-        (
-            Vec3::Z * ORIGIN_AXIS_LENGTH,
-            texts::AXIS_Z,
-            theme::to_color32(theme::ORIGIN_AXIS.2),
-        ),
-    ];
-    let axis_font = egui::FontId::proportional(13.0);
-    for (tip, letter, color) in tips {
-        if let Some(pos) = anchor_pos(&view_proj, view_rect, tip) {
-            painter.text(
-                pos + egui::vec2(3.0, 0.0),
-                egui::Align2::LEFT_CENTER,
-                letter,
-                axis_font.clone(),
-                color,
-            );
-        }
-    }
-}
-
 fn paint_frame_axis_labels(
     painter: &egui::Painter,
     view_proj: &Mat4,
