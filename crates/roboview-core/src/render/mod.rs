@@ -61,6 +61,7 @@ pub mod counters;
 pub mod grid;
 pub mod line;
 pub mod mesh;
+pub mod pick;
 pub mod renderer;
 
 pub use camera_math::anchor_to_screen;

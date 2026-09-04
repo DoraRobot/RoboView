@@ -103,11 +103,11 @@ pub const AXIS_Y_COLOR_SRGB: io::Color = io::Color { r: 0, g: 255, b: 0 };
 pub const AXIS_Z_COLOR_SRGB: io::Color = io::Color { r: 0, g: 0, b: 255 };
 
 /// Arrow head length as a fraction of the shaft length.
-const ARROW_HEAD_FRACTION: f32 = 0.25;
+pub(crate) const ARROW_HEAD_FRACTION: f32 = 0.25;
 
 /// Half spread of the arrow head lines from the reverse shaft direction
 /// (30°): the two head lines open a 60° head.
-const ARROW_HEAD_HALF_ANGLE: f32 = std::f32::consts::FRAC_PI_6;
+pub(crate) const ARROW_HEAD_HALF_ANGLE: f32 = std::f32::consts::FRAC_PI_6;
 
 /// One CPU-side colored line strip: an ordered run of vertices drawn as one
 /// `LineStrip` primitive, all in one color. Invariant: uploaded strips have

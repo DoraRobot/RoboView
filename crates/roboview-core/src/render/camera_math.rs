@@ -318,6 +318,28 @@ pub fn orientation_gizmo_dirs(
     ]
 }
 
+/// The screen offset (egui px, y down) between a world point's projection
+/// under a *new* view-projection and a fixed cursor pixel — the cursor-anchor
+/// zoom correction (spec A11): the app captures the world point under the
+/// cursor, zooms, then moves the camera target along the focal plane so this
+/// offset returns to zero. Pure and stateless like its siblings, and as
+/// precise as the projection itself: pointing back at the same world point
+/// after the correction leaves a remainder of zero, not an approximation.
+///
+/// Returns `None` exactly when [`anchor_to_screen`] would (the point falls
+/// behind the eye, outside the clip volume or depth range, or the inputs are
+/// degenerate) — the caller then skips the correction and keeps the plain
+/// zoom, so a world point leaving the frustum mid-gesture degrades smoothly
+/// instead of jumping.
+pub fn zoom_cursor_screen_offset(
+    view_proj_after: &Mat4,
+    viewport_px: Vec2,
+    world_point: Vec3,
+    cursor_px: Vec2,
+) -> Option<Vec2> {
+    anchor_to_screen(view_proj_after, viewport_px, world_point).map(|after| after - cursor_px)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,5 +962,71 @@ mod tests {
                 [none; 3]
             );
         }
+    }
+    #[test]
+    fn zoom_cursor_offset_returns_the_projection_drift() {
+        // A camera looking at the origin from -Y, zoomed out twice: the
+        // world point (1, 0, 0) must end up half as far from the screen
+        // center? No — zooming OUT shrinks the image around the principal
+        // axis, so the same world point moves *toward* the viewport
+        // center. The offset is (after - cursor), i.e. negative along the
+        // direction from center to cursor.
+        let half = SIZE * 0.5;
+        let near = level_camera(10.0);
+        let far = level_camera(20.0);
+        let vp_near = near.view_proj(SIZE.x / SIZE.y);
+        let vp_far = far.view_proj(SIZE.x / SIZE.y);
+        let world = Vec3::new(2.0, 0.0, 0.0);
+
+        let before = anchor_to_screen(&vp_near, SIZE, world).unwrap();
+        let cursor = Vec2::new(before.x, before.y);
+        let offset = zoom_cursor_screen_offset(&vp_far, SIZE, world, cursor);
+        assert!(offset.is_some());
+        let off = offset.unwrap();
+        // The drift must point from the new screen position toward the
+        // cursor (a shrinking image brings the point inward): offset ==
+        // after - before, with |after - center| < |before - center|.
+        assert!((off - (anchor_to_screen(&vp_far, SIZE, world).unwrap() - before)).length() < 1e-4);
+        assert!(
+            (anchor_to_screen(&vp_far, SIZE, world).unwrap() - half).length()
+                < (before - half).length(),
+            "out-zoom must pull the point toward the principal axis"
+        );
+        // The offset at the world point's OWN post-zoom projection is
+        // exactly zero — the identity a well-behaved correction converges
+        // to (no drift to remove when the anchor already sits on the
+        // cursor).
+        let exact = anchor_to_screen(&vp_far, SIZE, world).unwrap();
+        assert_eq!(
+            zoom_cursor_screen_offset(&vp_far, SIZE, world, exact),
+            Some(Vec2::ZERO)
+        );
+    }
+
+    #[test]
+    fn zoom_cursor_offset_degrades_to_none_with_its_projection() {
+        let camera = level_camera(10.0);
+        let view_proj = camera.view_proj(SIZE.x / SIZE.y);
+        // Behind the eye: same None contract as anchor_to_screen (the
+        // level camera looks from +|y| toward the origin; a point beyond
+        // the eye clips with w ≤ 0).
+        assert_eq!(
+            zoom_cursor_screen_offset(&view_proj, SIZE, Vec3::new(0.0, -30.0, 5.0), Vec2::ZERO),
+            None
+        );
+        // Degenerate viewport and garbage matrix.
+        assert_eq!(
+            zoom_cursor_screen_offset(
+                &Mat4::from_cols_array(&[f32::NAN; 16]),
+                SIZE,
+                Vec3::ZERO,
+                Vec2::ZERO
+            ),
+            None
+        );
+        assert_eq!(
+            zoom_cursor_screen_offset(&view_proj, Vec2::new(0.0, 0.0), Vec3::ZERO, Vec2::ZERO),
+            None
+        );
     }
 }
