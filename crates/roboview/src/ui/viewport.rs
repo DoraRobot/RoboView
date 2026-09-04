@@ -952,16 +952,28 @@ impl ViewportState {
             // options radius fits `segment_capacity_bound(options)`, so
             // the window clamped to the cap below can never outgrow the
             // prebuilt buffers (render/grid.rs).
-            let options = render::grid::GridOptions::new(GRID_STEP, GRID_RADIUS_CAP);
+            let options = render::grid::GridOptions::new(GRID_STEP, GRID_RADIUS_CAP, 2.0);
             let mesh = line_pipeline.with_capacity(render::grid::segment_capacity_bound(&options));
             self.grid_mesh = Some(mesh);
         }
         let Some(window) = grid_window(&view_proj, self.viewport_size()) else {
             return;
         };
+        // Pixels-per-meter at the camera-target plane: the zoom metric of
+        // the step ladder. It depends on the eye-to-target distance (and
+        // the FOV/viewport) only, never on pitch or yaw — so rotating the
+        // camera never reselects the grid step (004 revision 2026-09-04).
+        let distance = self.scene.camera.distance();
+        let px_per_m = self.viewport_size().y
+            / (2.0 * distance * (self.scene.camera.vertical_fov() / 2.0).tan());
+        let px_per_m = if px_per_m.is_finite() && px_per_m > 0.0 {
+            px_per_m
+        } else {
+            1.0
+        };
         let view = render::grid::GridView::new(
             Vec3::new(window.center.x, window.center.y, 0.0),
-            render::grid::GridOptions::new(GRID_STEP, window.radius),
+            render::grid::GridOptions::new(GRID_STEP, window.radius, px_per_m),
         );
         let strips = render::grid::grid_strips(&view);
         let mesh = self
@@ -1898,7 +1910,7 @@ mod tests {
             Vec2::new(800.0, 600.0),
             Vec2::new(480.0, 360.0),
         ];
-        let prebuild = segment_capacity_bound(&GridOptions::new(GRID_STEP, GRID_RADIUS_CAP));
+        let prebuild = segment_capacity_bound(&GridOptions::new(GRID_STEP, GRID_RADIUS_CAP, 2.0));
         let mut windows = 0usize;
         for &target in &targets {
             for &yaw in &yaws {
@@ -1936,7 +1948,7 @@ mod tests {
                             // window before the f32 cast).
                             let view = GridView::new(
                                 Vec3::new(window.center.x, window.center.y, 0.0),
-                                GridOptions::new(GRID_STEP, window.radius),
+                                GridOptions::new(GRID_STEP, window.radius, 2.0),
                             );
                             let strips = grid_strips(&view);
                             assert!(

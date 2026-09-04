@@ -27,18 +27,29 @@
 //! the world origin, across the whole window — a coherent plane like the
 //! grids of mature 3D tools, never a concentric ring plan. `step` is the
 //! smallest 1-2-5 ladder value starting at the base step (default 1 m)
-//! that stays readable on screen for the current window:
+//! whose on-screen spacing at the camera-target plane stays readable
+//! (`step · px_per_m ≥ 2 px`):
 //!
 //! ```text
-//! radius ≤ 250·step   →   step stays as-is (≈1 m at the default ±100 m
-//!                        window; on-screen spacing ≥ ~2 px)
-//! radius > 250·step   →   the WHOLE grid switches to the next ladder step
-//!                        (1 → 2 → 5 → 10 → 20 → 50 → 100 m)
+//! step · px_per_m ≥ 2px   →   step stays as-is (the default pose reads 1 m)
+//! step · px_per_m <  2px   →   the WHOLE grid switches to the next ladder
+//!                              step (1 → 2 → 5 → 10 → 20 → 50 → 100 m)
 //! ```
 //!
-//! So the plane reads uniformly at every camera height; climbing up just
-//! coarsens the whole grid together (one discrete pop), and zooming in
-//! refines it back — exactly the behaviour of Blender's floor grid.
+//! `px_per_m` is the pixels-per-meter at the camera-target plane — it
+//! depends on the **zoom** (eye-to-target distance / viewport) only, never
+//! on the orientation. Rotating pitch or yaw therefore never reselects
+//! the step: the near-field grid keeps its world size, exactly like the
+//! floor grids of mature 3D tools (the perspective squeeze far away is a
+//! projection fact, not a density change).
+//!
+//! The generation window (`center ± radius`, the visible-ground measure)
+//! is additionally clamped to `250·step`: without alpha blending nothing
+//! can fade on the GPU, so the far end of a horizon-grazing view is cut
+//! at the same bound the readability gate uses — the no-alpha equivalent
+//! of Blender's floor-grid distance fade. The clamp also keeps the
+//! per-axis line count ≤ 2·250 + 1 for any pose (`segment_capacity_bound`
+//! is unchanged).
 //!
 //! # Step switches are discrete "pops", never crawling (A11)
 //!
@@ -46,18 +57,18 @@
 //! step measured from the world origin — `snap_floor` is exported for the
 //! same alignment elsewhere). Moving the camera therefore never moves a
 //! line: it only adds or removes whole lines where they enter or leave the
-//! window, and a step change happens at one radius as a discrete whole-grid
-//! event. Between events, line coordinates are bit-identical — no crawl, no
-//! fade, no ring seams to mind.
+//! window, and a step change happens at one zoom gate as a discrete
+//! whole-grid event. Between events, line coordinates are bit-identical —
+//! no crawl, no fade, no ring seams to mind.
 //!
 //! # Output, cost, and limits
 //!
 //! Returns axis-aligned `[Vec3; 2]` segments on Z=0 (each ordered low→high
 //! along its axis), all vertical lines (fixed `x`) then all horizontal
 //! lines (fixed `y`), coordinates ascending, every `step` meters — the
-//! uniform grid. The visible count is bounded: `radius/step ≤ 250` by step
-//! selection, so each axis emits at most ~500 lines (the recorded limit is
-//! ~1000 segments for any radius; [`segment_capacity_bound`] gives the
+//! uniform grid. The visible count is bounded: the window clamp (250·step)
+//! keeps each axis at most ~500 lines (the recorded limit is ~1000
+//! segments for any pose; [`segment_capacity_bound`] gives the
 //! pre-allocation guarantee).
 //!
 //! Generation lives in f32 world coordinates, so it is meaningful only
@@ -76,10 +87,23 @@ const DEFAULT_STEP: f32 = 1.0;
 /// Default generation-window half extent (spec §6: 默认 ±100 m).
 const DEFAULT_RADIUS: f32 = 100.0;
 
-/// The uniform step is used only while `radius ≤ MAX_RADIUS_PER_STEP ·
-/// step`, keeping its on-screen spacing above roughly 2 px (see module
-/// docs). 250 ≈ 1000 px / (2·2 px) for the reference viewport. When a
-/// window outgrows it, the WHOLE grid switches to the next ladder step.
+/// Default pixels-per-meter of the step ladder (a typical target-plane
+/// density at the reference pose: 1 m step reads at 2 px — the ladder
+/// gate itself). Purely a fixture for [`Default`]; the viewport always
+/// passes a live value.
+const DEFAULT_PX_PER_M: f32 = 2.0;
+
+/// Minimum on-screen spacing of the grid lines at the camera-target plane
+/// (see module docs): a step is readable while `step · px_per_m ≥ 2 px`,
+/// and the generation window is clamped to 250·step (the no-alpha fade
+/// cutoff). 250 ≈ 1000 px / (2·2 px) for the reference viewport.
+const MIN_GRID_SCREEN_SPACING_PX: f32 = 2.0;
+
+/// Generation-window clamp in units of the current step (the no-alpha
+/// fade cutoff, see module docs): the farthest line is at most 250 steps
+/// away from the camera footprint, so a horizon-grazing view cannot grow
+/// an unbounded line set and the visible plain ends where a GPU fade
+/// would have zeroed it.
 const MAX_RADIUS_PER_STEP: f32 = 250.0;
 
 /// Safety valve on the step ladder (radius so huge that the ladder would
@@ -95,29 +119,39 @@ const LADDER_GUARD: usize = 1024;
 /// coherent grid; only the *whole* step changes with camera height).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GridOptions {
-    /// Base step of the uniform grid (spec §6 default 1 m). The step used
-    /// for a given window is the smallest ladder value `≥ base` that stays
-    /// readable on screen (`radius ≤ MAX_RADIUS_PER_STEP·step`) — so the
-    /// whole grid switches together when the camera climbs, instead of
-    /// thinning in rings.
+    /// Base step of the uniform grid (spec §6 default 1 m) — the finest
+    /// step the ladder ever uses. The step actually drawn is the smallest
+    /// ladder value `≥ base` whose on-screen spacing at the target plane
+    /// stays readable, so the whole grid switches together on a **zoom**,
+    /// never because the orientation changed.
     pub step: f32,
     /// Half extent of the square generation window around the camera
     /// footprint (spec §6 default ±100 m; it expands and contracts with
-    /// the camera zoom).
+    /// the camera zoom), clamped to `MAX_RADIUS_PER_STEP·step` inside
+    /// [`grid_strips`] — the no-alpha fade cutoff.
     pub radius: f32,
+    /// Pixels per world-meter at the camera-target plane — the zoom
+    /// metric driving the step ladder. It depends on the eye-to-target
+    /// distance and the viewport only, never on pitch or yaw.
+    pub px_per_m: f32,
 }
 
 impl GridOptions {
     /// Builds options from the raw values (no validation — invalid values
-    /// are handled by [`grid_strips`]).
-    pub fn new(step: f32, radius: f32) -> Self {
-        Self { step, radius }
+    /// are handled by [`grid_strips`], and a non-positive or non-finite
+    /// `px_per_m` degrades to the base step).
+    pub fn new(step: f32, radius: f32, px_per_m: f32) -> Self {
+        Self {
+            step,
+            radius,
+            px_per_m,
+        }
     }
 }
 
 impl Default for GridOptions {
     fn default() -> Self {
-        Self::new(DEFAULT_STEP, DEFAULT_RADIUS)
+        Self::new(DEFAULT_STEP, DEFAULT_RADIUS, DEFAULT_PX_PER_M)
     }
 }
 
@@ -179,20 +213,31 @@ pub fn snap_floor(value: f32, step: f32) -> f32 {
     (value / step).floor() * step
 }
 
-/// The uniform step of the whole grid for a window of `radius` meters:
-/// the smallest ladder value (from the 1-2-5 sequence starting at `base`)
-/// with `radius ≤ MAX_RADIUS_PER_STEP·step` — one step everywhere inside
-/// the window. `base` must be positive; a ladder stop after
-/// [`LADDER_GUARD`] steps returns the current value (huge windows run out
-/// of f32 precision long before the guard does).
-pub(crate) fn uniform_step(base: f32, radius: f32) -> f32 {
+/// The uniform step of the whole grid: the smallest ladder value (from
+/// the 1-2-5 sequence starting at `base`) whose on-screen spacing at the
+/// camera-target plane stays readable — `step · px_per_m ≥
+/// MIN_GRID_SCREEN_SPACING_PX` — one step everywhere, one event on a
+/// zoom. A non-positive or non-finite `px_per_m` degrades to the base
+/// step (no density signal); `base` must be positive; a ladder stop after
+/// [`LADDER_GUARD`] steps returns the current value (a dust-thin pixel
+/// metric cannot exhaust the ladder before f32 precision does).
+pub(crate) fn uniform_step(base: f32, px_per_m: f32) -> f32 {
     let mut step = if base.is_finite() && base > 0.0 {
         base as f64
     } else {
         1.0
     };
+    let px = if px_per_m.is_finite() && px_per_m > 0.0 {
+        px_per_m as f64
+    } else {
+        0.0
+    };
+    if px <= 0.0 {
+        // No density signal: degrade to the base step, never panic.
+        return step as f32;
+    }
     for _ in 0..LADDER_GUARD {
-        if (radius as f64) <= MAX_RADIUS_PER_STEP as f64 * step {
+        if step * px >= MIN_GRID_SCREEN_SPACING_PX as f64 {
             break;
         }
         step = next_step(step);
@@ -217,12 +262,14 @@ pub fn grid_strips(view: &GridView) -> Vec<[Vec3; 2]> {
     {
         return Vec::new();
     }
-    let step = uniform_step(opts.step, opts.radius);
+    let step = uniform_step(opts.step, opts.px_per_m);
     if !step.is_finite() || step <= 0.0 {
         return Vec::new();
     }
     let center = view.center.truncate();
-    let half = opts.radius as f64;
+    // Visible-ground window, clamped to the no-alpha fade cutoff (see
+    // module docs): the farthest line is ≤ 250 steps away.
+    let half = (opts.radius as f64).min(MAX_RADIUS_PER_STEP as f64 * step as f64);
     let step = step as f64;
     // Lattice-index run over the window: every k·step with |k·step − c| ≤
     // half is a whole line (a f32-rounded lattice line can sit exactly on
@@ -274,10 +321,9 @@ pub fn grid_strips(view: &GridView) -> Vec<[Vec3; 2]> {
 
 /// Upper bound on the number of segments [`grid_strips`] returns for any
 /// [`GridView`] carrying the same options (any center; `radius` up to the
-/// given value). The uniform step keeps `radius/step ≤ 250` by selection
-/// (see [`uniform_step`]) — for *any* radius, not just the option's — so
-/// each axis emits at most `2·250 + 2·(window rounding slack) + 2` lines
-/// and the total is a fixed small number for every configuration: one
+/// given value). The window clamp (250·step, see [`grid_strips`])) bounds
+/// each axis at `2·250 + 1` lines regardless of the visible ground size,
+/// so the total is a fixed small number for every configuration: one
 /// prebuild of this size covers any window up to the options radius (the
 /// grid module's capacity-guarantee contract, viewport.rs relies on it).
 pub fn segment_capacity_bound(options: &GridOptions) -> usize {
@@ -294,14 +340,25 @@ pub fn segment_capacity_bound(options: &GridOptions) -> usize {
 mod tests {
     use super::*;
 
-    /// Options with the default step and the given window radius.
+    /// Options with the default step, the given window radius and the
+    /// reference density (2 px/m — the ladder gate, so the step stays 1 m).
     fn opts(radius: f32) -> GridOptions {
-        GridOptions::new(1.0, radius)
+        GridOptions::new(1.0, radius, 2.0)
     }
 
-    /// Default step and radius, centered at `(x, y)`.
+    /// Options with an explicit pixel density.
+    fn opts_px(radius: f32, px_per_m: f32) -> GridOptions {
+        GridOptions::new(1.0, radius, px_per_m)
+    }
+
+    /// Default step/radius and density, centered at `(x, y)`.
     fn view(x: f32, y: f32, radius: f32) -> GridView {
         GridView::new(Vec3::new(x, y, 0.0), opts(radius))
+    }
+
+    /// View with an explicit pixel density.
+    fn view_px(x: f32, y: f32, radius: f32, px_per_m: f32) -> GridView {
+        GridView::new(Vec3::new(x, y, 0.0), opts_px(radius, px_per_m))
     }
 
     /// Segments with fixed `x` (lines running along Y), as (x, lo, hi).
@@ -372,34 +429,68 @@ mod tests {
     }
 
     #[test]
-    fn uniform_step_picks_the_first_ladder_value_that_stays_readable() {
-        // radius ≤ 250·step keeps the step; one ladder rung too big and
-        // the WHOLE grid switches (1 → 2 → 5 → 10 → 20 → 50 → 100 → 200).
+    fn uniform_step_picks_the_first_ladder_value_at_the_density_gate() {
+        // The whole-grid ladder gate: step·px_per_m ≥ 2 px.
         let cases = [
-            (100.0, 1.0),
-            (250.0, 1.0),
-            (251.0, 2.0),
-            (400.0, 2.0),
-            (500.0, 2.0),
-            (501.0, 5.0),
-            (1250.0, 5.0),
-            (1251.0, 10.0),
-            (12500.0, 50.0),
-            (62500.0, 500.0),
+            (1.0, 3.0, 1.0),
+            (1.0, 2.0, 1.0),
+            (1.0, 1.9, 2.0),
+            (1.0, 0.51, 5.0), // 2·0.51 = 1.02 < 2 → 5
+            (1.0, 0.2, 10.0), // 5·0.2 = 1.0 < 2 → 10
+            (1.0, 0.09, 50.0),
+            (0.5, 10.0, 0.5), // finest = base
+            (0.5, 3.0, 1.0),  // 0.5·3 = 1.5 < 2
         ];
-        for (radius, expected) in cases {
-            assert_eq!(uniform_step(1.0, radius), expected, "radius {radius}");
+        for (base, px, expected) in cases {
+            assert_eq!(uniform_step(base, px), expected, "base {base} px {px}");
         }
-        // A custom base below 1 m climbs onto the ladder when needed.
-        assert_eq!(uniform_step(0.5, 50.0), 0.5);
-        assert_eq!(uniform_step(0.5, 200.0), 1.0);
+        // A dust-thin density keeps climbing (no stall, no wrap-around).
+        let huge = uniform_step(1.0, 3.0e-37);
+        assert!(huge.is_finite() && huge * 3.0e-37 >= 2.0, "huge {huge}");
+        // No density signal: degrade to the base step, never panic.
+        for px in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(uniform_step(1.0, px), 1.0, "px {px}");
+        }
         // Non-finite/negative bases fall back to the 1 m ladder.
-        assert_eq!(uniform_step(f32::NAN, 1e3), 5.0);
-        assert_eq!(uniform_step(-1.0, 1e3), 5.0);
-        // Huge windows keep climbing the ladder (no stall, no tiny-step
-        // regression — powi rounding at 1e35 scale stays inside tolerance).
-        let huge = uniform_step(1.0, 3.0e37);
-        assert!((huge - 2.0e35).abs() <= 2.0e35 * 1e-4, "huge step {huge}");
+        assert_eq!(uniform_step(f32::NAN, 3.0), 1.0);
+        assert_eq!(uniform_step(-1.0, 3.0), 1.0);
+    }
+
+    #[test]
+    fn pitch_changes_never_reselect_the_step() {
+        // The 2026-09-04 fix: the step is driven by the camera-target
+        // plane's pixel density (zoom), NOT by the visible-ground radius
+        // — so a pure rotation (which changes how much ground is visible)
+        // never changes the grid size, like mature 3D tools.
+        for radius in [100.0, 5000.0, 1.0e6, 4.0e7] {
+            let strips = grid_strips(&view_px(0.0, 0.0, radius, 2.0));
+            let xs = vertical_x_coords(&strips);
+            for w in xs.windows(2) {
+                assert_eq!(
+                    w[1] - w[0],
+                    1.0,
+                    "radius {radius}: the step must not move with the window"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn far_fade_clamps_the_generation_window() {
+        // No alpha on the line pipeline, so the far end of a horizon view
+        // is cut at 250·step — the fade-equivalent. A ±4e7 window (a
+        // grazing pitch) still yields exactly ±250 m of 1 m lines.
+        let strips = grid_strips(&view_px(0.0, 0.0, 4.0e7, 2.0));
+        let xs = vertical_x_coords(&strips);
+        let expected: Vec<f32> = (-250..=250).map(|k| k as f32).collect();
+        assert_eq!(xs, expected);
+        assert_eq!(strips.len(), 2 * 501);
+        // A coarse step clamps the window at the same bound (250·50 m).
+        let strips = grid_strips(&view_px(0.0, 0.0, 1.0e5, 0.09));
+        let xs = vertical_x_coords(&strips);
+        assert_eq!(xs.len(), 2 * (12_500.0 / 50.0) as usize + 1);
+        assert_eq!(*xs.first().unwrap(), -12_500.0);
+        assert_eq!(*xs.last().unwrap(), 12_500.0);
     }
 
     #[test]
@@ -448,20 +539,18 @@ mod tests {
 
     #[test]
     fn whole_grid_uses_one_step_only_at_every_zoom() {
-        // The user-visible property (004 revision): the visible ground is
-        // one coherent grid — no near/far density difference. Every fixed
-        // coordinate is a multiple of one step and consecutive coordinates
-        // are exactly one step apart, at every tested zoom.
-        for (radius, step, count) in [
-            (100.0, 1.0, 201),
-            (251.0, 2.0, 2 * (251.0f32 / 2.0).floor() as usize + 1),
-            (600.0, 5.0, 2 * (600.0f32 / 5.0).floor() as usize + 1),
-            (1300.0, 10.0, 2 * (1300.0f32 / 10.0).floor() as usize + 1),
-            (6250.0, 50.0, 2 * (6250.0f32 / 50.0).floor() as usize + 1),
+        // The user-visible property: the visible ground is one coherent
+        // grid at every zoom — every fixed coordinate is a multiple of one
+        // step and consecutive coordinates are exactly one step apart.
+        for (radius, px, step, count) in [
+            (100.0, 2.0, 1.0, 201),
+            (600.0, 0.51, 5.0, 241),
+            (1300.0, 0.2, 10.0, 261),
+            (1.0e5, 0.09, 50.0, 501),
         ] {
-            let strips = grid_strips(&view(0.0, 0.0, radius));
+            let strips = grid_strips(&view_px(0.0, 0.0, radius, px));
             let xs = vertical_x_coords(&strips);
-            assert_eq!(xs.len(), count, "radius {radius}, step {step}");
+            assert_eq!(xs.len(), count, "radius {radius} px {px}, step {step}");
             for w in xs.windows(2) {
                 assert_eq!(w[1] - w[0], step, "radius {radius}: uniform spacing");
             }
@@ -474,26 +563,25 @@ mod tests {
 
     #[test]
     fn zoom_switches_the_whole_grid_as_one_event() {
-        // Climbing the camera switches every line at once at the gate
-        // radius 250·step — no mixed densities, no inner/outer zones.
-        let step_of = |radius: f32, strips: &[[Vec3; 2]]| {
-            let xs = vertical_x_coords(strips);
-            let mut s = None;
-            for w in xs.windows(2) {
-                let d = w[1] - w[0];
-                assert!(d <= 1.5 * s.unwrap_or(d), "radius {radius}: single step");
-                s = Some(d);
-            }
-            s.expect("non-empty grid")
-        };
+        // Zooming out (px_per_m falling) switches every line at once at
+        // the gate — no mixed densities, no inner/outer zones.
         let mut prev = 0.0;
-        for radius in [
-            100.0, 250.0, 251.0, 500.0, 501.0, 1250.0, 1251.0, 6250.0, 6251.0,
+        for [px, expected] in [
+            [3.0, 1.0],
+            [2.0, 1.0],
+            [1.9, 2.0],
+            [0.51, 5.0],
+            [0.2, 10.0],
+            [0.09, 50.0],
         ] {
-            let strips = grid_strips(&view(0.0, 0.0, radius));
-            let step = step_of(radius, &strips);
-            assert_eq!(step, uniform_step(1.0, radius), "radius {radius}");
-            assert!(step >= prev, "radius {radius}: steps never shrink");
+            let strips = grid_strips(&view_px(0.0, 0.0, 1000.0, px));
+            let xs = vertical_x_coords(&strips);
+            for w in xs.windows(2) {
+                assert_eq!(w[1] - w[0], expected, "px {px}: single step");
+            }
+            let step = xs.windows(2).next().map(|w| w[1] - w[0]).unwrap();
+            assert_eq!(step, uniform_step(1.0, px), "px {px}");
+            assert!(step >= prev, "px {px}: steps never shrink");
             prev = step;
         }
     }
@@ -532,13 +620,13 @@ mod tests {
         let good = Vec3::ZERO;
         for radius in [0.0, -3.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(
-                grid_strips(&GridView::new(good, GridOptions::new(1.0, radius))).is_empty(),
+                grid_strips(&GridView::new(good, GridOptions::new(1.0, radius, 2.0))).is_empty(),
                 "radius {radius}"
             );
         }
         for step in [0.0, -2.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(
-                grid_strips(&GridView::new(good, GridOptions::new(step, 100.0))).is_empty(),
+                grid_strips(&GridView::new(good, GridOptions::new(step, 100.0, 2.0))).is_empty(),
                 "step {step}"
             );
         }
@@ -554,12 +642,20 @@ mod tests {
         let mut zombie = Vec3::ZERO;
         zombie.z = f32::NAN;
         assert!(!grid_strips(&GridView::new(zombie, GridOptions::default())).is_empty());
+        // A null pixel density is NOT invalid: it degrades to the base
+        // step and still emits the grid.
+        for px in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                !grid_strips(&GridView::new(good, GridOptions::new(1.0, 10.0, px))).is_empty(),
+                "px {px}"
+            );
+        }
     }
 
     #[test]
     fn astronomical_windows_stay_finite_and_panic_free() {
-        // Ladder gates the step, so even a 1e12 m window yields ~a few
-        // hundred finite lines (coerce, never overflow).
+        // The fade clamp bounds the line set, so even a 1e12 m window
+        // yields a few hundred finite lines (coerce, never overflow).
         let radius = 1.0e12;
         let strips = grid_strips(&view(0.0, 0.0, radius));
         assert!(!strips.is_empty());
@@ -572,20 +668,21 @@ mod tests {
 
     #[test]
     fn segments_never_exceed_the_declared_capacity_bound() {
-        // The uniform step keeps radius/step ≤ 250, so any window fits a
-        // few-hundred-line — the prebuilt persistent mesh (viewport.rs)
-        // relies on this bound.
+        // The window clamp (250·step) bounds any pose at ~1000 lines, so
+        // the prebuilt persistent mesh (viewport.rs) fits them all.
         for radius in [
             0.001, 1.0, 100.0, 260.0, 600.0, 1300.0, 1e4, 1e6, 1e9, 1e12, 3.0e37,
         ] {
-            let options = opts(radius);
-            let strips = grid_strips(&view(5.0, -9.0, radius));
-            assert!(
-                strips.len() <= segment_capacity_bound(&options),
-                "radius {radius}: {} > {}",
-                strips.len(),
-                segment_capacity_bound(&options)
-            );
+            for px in [0.09, 0.51, 2.0, 10.0] {
+                let options = opts_px(radius, px);
+                let strips = grid_strips(&view_px(5.0, -9.0, radius, px));
+                assert!(
+                    strips.len() <= segment_capacity_bound(&options),
+                    "radius {radius} px {px}: {} > {}",
+                    strips.len(),
+                    segment_capacity_bound(&options)
+                );
+            }
         }
         // And that bound is a fixed small number: one prebuild covers any.
         for radius in [100.0, 260.0, 600.0, 1e4, 1e12] {
@@ -598,9 +695,9 @@ mod tests {
 
     #[test]
     fn default_grid_renders_uniform_density_across_the_whole_window() {
-        // Directly the property the 004 revision adds: at the default
-        // window there is no dense center and sparse edge — the border
-        // lines are one step from their neighbours, same as at the origin.
+        // At the default window there is no dense center and sparse edge —
+        // the border lines are one step from their neighbours, same as at
+        // the origin.
         let strips = grid_strips(&GridView::default());
         let xs = vertical_x_coords(&strips);
         for w in xs.windows(2) {

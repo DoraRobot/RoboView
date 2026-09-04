@@ -180,6 +180,13 @@ impl OrbitCamera {
         self.distance
     }
 
+    /// Vertical field of view (the `FOV_Y` constant), exported so the
+    /// app can derive pixels-per-meter at the target plane — the zoom
+    /// metric the ground grid ladder uses (pitch never changes it).
+    pub fn vertical_fov(&self) -> f32 {
+        FOV_Y
+    }
+
     /// Eye position in world space for the current pose.
     fn eye(&self) -> Vec3 {
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
