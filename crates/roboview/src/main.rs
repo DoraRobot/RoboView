@@ -747,8 +747,12 @@ impl RoboViewApp {
             .width_range(180.0..=360.0)
             .frame(frame)
             .show(ctx, |ui| {
-                let lock = viewport::lock_state(&state);
+                // The multi-selection ids must be read BEFORE the scene
+                // lock below: the viewport mutex is not reentrant and a
+                // nested lock_state would deadlock the frame (the same
+                // trap as the 004 install path).
                 let selected_ids = viewport::lock_state(&state).selected_ids();
+                let lock = viewport::lock_state(&state);
                 objects_panel::ui(
                     ui,
                     &mut self.objects_state,
@@ -801,8 +805,10 @@ impl RoboViewApp {
             .width_range(200.0..=360.0)
             .frame(frame)
             .show(ctx, |ui| {
-                let lock = viewport::lock_state(&self.viewport);
+                // Read the count before the scene lock (non-reentrant
+                // viewport mutex — a nested lock_state deadlocks).
                 let selected_count = viewport::lock_state(&self.viewport).selected_ids().len();
+                let lock = viewport::lock_state(&self.viewport);
                 properties_panel::ui(
                     ui,
                     self.objects_state.selected,
